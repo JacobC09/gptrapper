@@ -12,10 +12,22 @@ import { ResultScreen } from "@/components/ResultScreen"
 import { MidiResultScreen } from "@/components/MidiResultScreen"
 import GeneratingScreen from "@/components/GenerationScreen"
 import BeatPromptScreen from "@/components/BeatPromptScreen"
+import { ModeChoiceScreen, type GenerationMode } from "@/components/ModeChoiceScreen"
+import { SongMappingScreen } from "@/components/SongMappingScreen"
+import { SongResultScreen } from "@/components/SongResultScreen"
 import type { Clip } from "@/lib/audio"
-import type { GenerateResponse, InstrumentType } from "@/lib/types"
+import type { GenerateResponse, InstrumentType, TrackMapping } from "@/lib/types"
 
-type AppStatus = "idle" | "generating_samples" | "selecting_types" | "prompting_genre" | "generating_midi" | "done"
+type AppStatus =
+    | "idle"
+    | "generating_samples"
+    | "selecting_types"
+    | "choosing_mode"
+    | "prompting_genre"
+    | "generating_midi"
+    | "done"
+    | "mapping_song"
+    | "song_done"
 
 export default function Home() {
     const recorder = useAudioRecorder()
@@ -23,6 +35,8 @@ export default function Home() {
     const [appStatus, setAppStatus] = useState<AppStatus>("idle")
     const [result, setResult] = useState<GenerateResponse | null>(null)
     const [assignedTypes, setAssignedTypes] = useState<InstrumentType[]>([])
+    const [songMidiUrl, setSongMidiUrl] = useState<string | null>(null)
+    const [trackMapping, setTrackMapping] = useState<TrackMapping | null>(null)
     const clipsRef = useRef(clips)
     clipsRef.current = clips
 
@@ -56,13 +70,18 @@ export default function Home() {
         try {
             const formData = new FormData()
             formData.append("prompt", "analyze")
+            const currentClips = clipsRef.current
             const blobs = await Promise.all(
-                clipsRef.current.map(async (clip) => {
+                currentClips.map(async (clip) => {
                     const res = await fetch(clip.url)
                     return res.blob()
                 })
             )
-            blobs.forEach((blob, i) => formData.append("clips", blob, `clip_${i}.webm`))
+            blobs.forEach((blob, i) => {
+                const ext = currentClips[i]?.ext ?? "webm"
+                formData.append("clips", blob, `clip_${i}.${ext}`)
+                formData.append("durations_ms", String(currentClips[i]?.durationMs ?? 0))
+            })
 
             const res = await fetch("/api/generate", { method: "POST", body: formData })
             if (!res.ok) throw new Error(`Server responded ${res.status}`)
@@ -78,7 +97,21 @@ export default function Home() {
 
     const handleTypesConfirm = (types: InstrumentType[]) => {
         setAssignedTypes(types)
-        setAppStatus("prompting_genre")
+        setAppStatus("choosing_mode")
+    }
+
+    const handleModeChoice = (mode: GenerationMode) => {
+        if (mode === "beat") {
+            setAppStatus("prompting_genre")
+        } else {
+            setAppStatus("mapping_song")
+        }
+    }
+
+    const handleSongConfirm = (midiUrl: string, mapping: TrackMapping) => {
+        setSongMidiUrl(midiUrl)
+        setTrackMapping(mapping)
+        setAppStatus("song_done")
     }
 
     const handleCreateMidi = async (style: string, additional: string) => {
@@ -108,6 +141,8 @@ export default function Home() {
         })
         setResult(null)
         setAssignedTypes([])
+        setSongMidiUrl(null)
+        setTrackMapping(null)
         setAppStatus("idle")
     }
 
@@ -202,8 +237,23 @@ export default function Home() {
                         <ResultScreen key="selecting_types" result={result} clips={clips} onConfirm={handleTypesConfirm} />
                     )}
 
+                    {appStatus === "choosing_mode" && (
+                        <ModeChoiceScreen key="choosing_mode" onChoose={handleModeChoice} />
+                    )}
+
                     {appStatus === "prompting_genre" && (
                         <BeatPromptScreen key="prompting_genre" onConfirm={handleCreateMidi} />
+                    )}
+
+                    {appStatus === "mapping_song" && result && (
+                        <SongMappingScreen
+                            key="mapping_song"
+                            clips={clips}
+                            samples={result.samples}
+                            assignedTypes={assignedTypes}
+                            onConfirm={handleSongConfirm}
+                            onBack={() => setAppStatus("choosing_mode")}
+                        />
                     )}
 
                     {appStatus === "done" && result && (
@@ -213,6 +263,18 @@ export default function Home() {
                             samples={result.samples}
                             assignedTypes={assignedTypes}
                             onReset={handleReset}
+                        />
+                    )}
+
+                    {appStatus === "song_done" && result && songMidiUrl && trackMapping && (
+                        <SongResultScreen
+                            key="song_done"
+                            midiUrl={songMidiUrl}
+                            clips={clips}
+                            samples={result.samples}
+                            trackMapping={trackMapping}
+                            onReset={handleReset}
+                            onBackToMapping={() => setAppStatus("mapping_song")}
                         />
                     )}
                 </AnimatePresence>

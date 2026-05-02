@@ -17,3 +17,17 @@ export type GenerateResponse = {
     clips_received: number
     samples: Sample[]
 }
+
+// Maps a MIDI track index → sample index (in `samples[]`).
+// `null` means "use the default synth for this track".
+export type TrackMapping = Record<number, number | null>
+
+export type MidiTrackInfo = {
+    index: number
+    name: string
+    instrument: string
+    family: string
+    channel: number
+    isDrums: boolean
+    noteCount: number
+}

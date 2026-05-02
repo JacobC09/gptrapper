@@ -6,11 +6,13 @@ import { formatTime } from "@/lib/audio"
 import { MatIcon } from "@/components/MatIcon"
 import lamejs from "lamejs"
 import type { Clip } from "@/lib/audio"
-import type { InstrumentType, Sample } from "@/lib/types"
+import type { InstrumentType, Sample, TrackMapping } from "@/lib/types"
 
 type ToneNamespace = typeof import("tone")
 
-type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number; channel: number }
+type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number; channel: number; trackIdx: number }
+
+type TrackSamplers = { samplers: Map<number, unknown>; urls: string[] }
 
 type RollLayout = {
     minPitch: number
@@ -177,6 +179,52 @@ async function buildSamplerData(
     return { melodicUrl, drumUrls, allUrls }
 }
 
+// Build one WAV-blob URL per assigned MIDI track, slicing each chosen sample.
+async function buildTrackSamplerUrls(
+    clips: Clip[],
+    samples: Sample[],
+    trackMapping: TrackMapping,
+): Promise<{ urlByTrack: Record<number, string>; allUrls: string[] }> {
+    const ctx = new AudioContext()
+    const cached = new Map<number, AudioBuffer>()
+    const urlByTrack: Record<number, string> = {}
+    const allUrls: string[] = []
+
+    const getBuffer = async (clipIdx: number): Promise<AudioBuffer> => {
+        if (cached.has(clipIdx)) return cached.get(clipIdx)!
+        const res = await fetch(clips[clipIdx].url)
+        const decoded = await ctx.decodeAudioData(await res.arrayBuffer())
+        cached.set(clipIdx, decoded)
+        return decoded
+    }
+
+    const slice = (full: AudioBuffer, startS: number, durS: number): AudioBuffer => {
+        const sr = full.sampleRate
+        const start = Math.floor(startS * sr)
+        const n = Math.max(1, Math.min(Math.ceil(durS * sr), full.length - start))
+        const out = ctx.createBuffer(full.numberOfChannels, n, sr)
+        for (let ch = 0; ch < full.numberOfChannels; ch++) {
+            out.getChannelData(ch).set(full.getChannelData(ch).subarray(start, start + n))
+        }
+        return out
+    }
+
+    for (const [trackKey, sampleIdx] of Object.entries(trackMapping)) {
+        if (sampleIdx === null || sampleIdx === undefined) continue
+        const sample = samples[sampleIdx]
+        if (!sample) continue
+        const clip = clips[sample.clip_index]
+        if (!clip) continue
+        const buf = slice(await getBuffer(sample.clip_index), sample.start_s, sample.duration_s)
+        const url = URL.createObjectURL(audioBufferToWavBlob(buf))
+        urlByTrack[Number(trackKey)] = url
+        allUrls.push(url)
+    }
+
+    await ctx.close()
+    return { urlByTrack, allUrls }
+}
+
 function getTotalDurationS(notes: ParsedNote[]): number {
     return notes.reduce((max, note) => Math.max(max, note.timeS + note.durationS), 0)
 }
@@ -202,7 +250,10 @@ function createSynth(Tone: ToneNamespace) {
     return synth
 }
 
-async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
+async function renderMidiToBuffer(
+    notes: ParsedNote[],
+    trackUrls?: Record<number, string>,
+): Promise<AudioBuffer> {
     const Tone = await import("tone")
     const totalS = getTotalDurationS(notes)
     const renderDurationS = Math.max(totalS + MP3_TAIL_S, 0.25)
@@ -211,17 +262,37 @@ async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
         duration: Math.max(note.durationS, 0.05),
         midi: note.midi,
         velocity: Math.min(Math.max(note.velocity, 0.1), 1),
+        trackIdx: note.trackIdx,
     }))
 
-    const toneBuffer = await Tone.Offline(({ transport }) => {
+    const toneBuffer = await Tone.Offline(async ({ transport }) => {
         const synth = createSynth(Tone)
+        const samplersByTrack = new Map<number, InstanceType<typeof Tone.Sampler>>()
+
+        if (trackUrls) {
+            const loadPromises: Promise<void>[] = []
+            for (const [trackKey, url] of Object.entries(trackUrls)) {
+                loadPromises.push(new Promise<void>((resolve, reject) => {
+                    const sampler = new Tone.Sampler({
+                        urls: { "C4": url },
+                        release: 0.6,
+                        onload: () => resolve(),
+                        onerror: (e: Error) => reject(e),
+                    }).toDestination()
+                    samplersByTrack.set(Number(trackKey), sampler)
+                }))
+            }
+            await Promise.all(loadPromises)
+        }
+
         new Tone.Part((time, value) => {
-            synth.triggerAttackRelease(
-                Tone.Frequency(value.midi, "midi").toNote(),
-                value.duration,
-                time,
-                value.velocity
-            )
+            const noteStr = Tone.Frequency(value.midi, "midi").toNote()
+            const sampler = samplersByTrack.get(value.trackIdx)
+            if (sampler) {
+                sampler.triggerAttackRelease(noteStr, value.duration, time, value.velocity)
+            } else {
+                synth.triggerAttackRelease(noteStr, value.duration, time, value.velocity)
+            }
         }, events).start(0)
         transport.start(0)
     }, renderDurationS)
@@ -308,11 +379,13 @@ function drawPlayhead(ctx: CanvasRenderingContext2D, snapshots: RollSnapshots, l
 
 type SamplerPair = { melodic: unknown; percussion: unknown }
 
-export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
+export function MidiPlayer({ midiUrl, clips, samples, assignedTypes, trackMapping }: {
     midiUrl: string
     clips?: Clip[]
     samples?: Sample[]
     assignedTypes?: InstrumentType[]
+    /** Per-track override: trackIdx → sample index. Enables song-replace mode. */
+    trackMapping?: TrackMapping
 }) {
     const [status, setStatus] = useState<"loading" | "ready" | "error">("loading")
     const [isPlaying, setIsPlaying] = useState(false)
@@ -333,6 +406,8 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
     const synthRef = useRef<unknown>(null)
     const samplersRef = useRef<SamplerPair | null>(null)
     const samplerUrlsRef = useRef<string[]>([])
+    const trackSamplersRef = useRef<TrackSamplers | null>(null)
+    const trackUrlsRef = useRef<Record<number, string> | null>(null)
     const rafRef = useRef<number>(0)
     const progressRef = useRef(0)
     progressRef.current = progress
@@ -364,7 +439,7 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
                 const { Midi } = await import("@tonejs/midi")
                 const midi = new Midi(buf)
                 const notes: ParsedNote[] = []
-                for (const track of midi.tracks) {
+                midi.tracks.forEach((track, trackIdx) => {
                     const channel = track.channel ?? 0
                     for (const note of track.notes) {
                         notes.push({
@@ -373,9 +448,10 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
                             durationS: note.duration,
                             velocity: note.velocity ?? 0.8,
                             channel,
+                            trackIdx,
                         })
                     }
-                }
+                })
                 if (notes.length === 0) throw new Error("No notes found in MIDI file")
                 const totalDuration = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
                 notesRef.current = notes
@@ -391,9 +467,67 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
         return () => { controller.abort() }
     }, [midiUrl])
 
+    // Per-track sampler loader (song-replace mode)
+    useEffect(() => {
+        if (status !== "ready") return
+        if (!trackMapping) return
+        if (!clips?.length || !samples?.length) return
+
+        let cancelled = false
+        setSamplersLoading(true)
+        setSamplersReady(false)
+
+        ;(async () => {
+            try {
+                const { urlByTrack, allUrls } = await buildTrackSamplerUrls(clips, samples, trackMapping)
+                if (cancelled) { allUrls.forEach(u => URL.revokeObjectURL(u)); return }
+
+                const Tone = await import("tone")
+
+                // Dispose previous track samplers
+                const prev = trackSamplersRef.current
+                if (prev) {
+                    prev.samplers.forEach(s => (s as { dispose?: () => void })?.dispose?.())
+                    prev.urls.forEach(u => URL.revokeObjectURL(u))
+                }
+
+                const samplers = new Map<number, unknown>()
+                const loadPromises: Promise<void>[] = []
+                for (const [trackKey, url] of Object.entries(urlByTrack)) {
+                    loadPromises.push(new Promise<void>((resolve, reject) => {
+                        const sampler = new Tone.Sampler({
+                            urls: { "C4": url },
+                            release: 0.6,
+                            onload: resolve,
+                            onerror: (e: Error) => reject(e),
+                        }).toDestination()
+                        samplers.set(Number(trackKey), sampler)
+                    }))
+                }
+                await Promise.all(loadPromises)
+
+                if (!cancelled && mountedRef.current) {
+                    trackSamplersRef.current = { samplers, urls: allUrls }
+                    trackUrlsRef.current = urlByTrack
+                    setSamplersLoading(false)
+                    setSamplersReady(true)
+                    // Force MP3 re-render with new samplers on next play
+                    autoConvertRef.current = false
+                    setMp3Url(null)
+                }
+            } catch (e) {
+                console.error("[MidiPlayer] track sampler load failed:", e)
+                if (!cancelled && mountedRef.current) setSamplersLoading(false)
+            }
+        })()
+
+        return () => { cancelled = true }
+    }, [status, clips, samples, trackMapping])
+
     // Load samplers from recorded clips once MIDI is ready
     useEffect(() => {
         if (status !== "ready") return
+        if (trackMapping) return
         if (!clips?.length || !samples?.length || !assignedTypes?.length) return
 
         let cancelled = false
@@ -450,7 +584,7 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
         })
 
         return () => { cancelled = true }
-    }, [status, clips, samples, assignedTypes])
+    }, [status, clips, samples, assignedTypes, trackMapping])
 
     useEffect(() => () => {
         if (mp3Url) URL.revokeObjectURL(mp3Url)
@@ -462,7 +596,7 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
         setConvertError(null)
 
         try {
-            const buffer = await renderMidiToBuffer(notesRef.current)
+            const buffer = await renderMidiToBuffer(notesRef.current, trackUrlsRef.current ?? undefined)
             if (!mountedRef.current) return
             const blob = audioBufferToMp3(buffer)
             if (!mountedRef.current) return
@@ -484,9 +618,12 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
         if (status !== "ready") return
         if (autoConvertRef.current) return
         if (notesRef.current.length === 0) return
+        // In song-replace mode, wait for the per-track samplers before rendering MP3
+        // so the export contains the user's audio instead of the synth fallback.
+        if (trackMapping && !samplersReady) return
         autoConvertRef.current = true
         void convertToMp3(true)
-    }, [status, midiUrl, convertToMp3])
+    }, [status, midiUrl, convertToMp3, trackMapping, samplersReady])
 
     // Draw piano roll
     const redraw = useCallback(() => {
@@ -568,6 +705,11 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
                 ;(s.percussion as { dispose?: () => void })?.dispose?.()
             }
             samplerUrlsRef.current.forEach(u => URL.revokeObjectURL(u))
+            const ts = trackSamplersRef.current
+            if (ts) {
+                ts.samplers.forEach(s => (s as { dispose?: () => void })?.dispose?.())
+                ts.urls.forEach(u => URL.revokeObjectURL(u))
+            }
         }
     }, [])
 
@@ -593,6 +735,7 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
         const notes = notesRef.current
         const synth = synthRef.current as InstanceType<typeof Tone.PolySynth>
         const samplers = samplersRef.current
+        const trackSamplers = trackSamplersRef.current?.samplers
 
         for (const note of notes) {
             if (note.timeS + note.durationS <= offsetS) continue
@@ -602,9 +745,14 @@ export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
                 const dur = Math.max(note.durationS - Math.max(offsetS - note.timeS, 0), 0.05)
                 const vel = Math.min(Math.max(note.velocity, 0.1), 1)
 
-                const sampler = (note.channel === 9
-                    ? samplers?.percussion
-                    : samplers?.melodic) as InstanceType<typeof Tone.Sampler> | null | undefined
+                let sampler: InstanceType<typeof Tone.Sampler> | null | undefined = null
+                if (trackSamplers) {
+                    sampler = trackSamplers.get(note.trackIdx) as InstanceType<typeof Tone.Sampler> | undefined
+                } else {
+                    sampler = (note.channel === 9
+                        ? samplers?.percussion
+                        : samplers?.melodic) as InstanceType<typeof Tone.Sampler> | null | undefined
+                }
 
                 if (sampler) {
                     sampler.triggerAttackRelease(noteStr, dur, time, vel)
