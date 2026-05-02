@@ -4,8 +4,11 @@ import React, { useState, useRef, useEffect, useCallback } from "react"
 import { motion } from "motion/react"
 import { formatTime } from "@/lib/audio"
 import { MatIcon } from "@/components/MatIcon"
+import lamejs from "lamejs"
 
-type ParsedNote = { midi: number; timeS: number; durationS: number }
+type ToneNamespace = typeof import("tone")
+
+type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number }
 
 type RollLayout = {
     minPitch: number
@@ -21,6 +24,10 @@ const BLACK_KEYS = new Set([1, 3, 6, 8, 10])
 const CANVAS_HEIGHT_PX = 320
 const PITCH_PAD = 2
 const DIM_ALPHA = 0.3
+const MP3_BITRATE = 192
+const MP3_BLOCK_SIZE = 1152
+const MP3_FILENAME = "generated_beat.mp3"
+const MP3_TAIL_S = 0.6
 
 const PITCH_COLORS: [number, number, number][] = [
     [0,   219, 233],   // Primary cyan
@@ -34,6 +41,89 @@ type RollSnapshots = { dim: HTMLCanvasElement; bright: HTMLCanvasElement }
 function noteColor(midi: number, alpha: number): string {
     const [r, g, b] = PITCH_COLORS[midi % PITCH_COLORS.length]
     return `rgba(${r},${g},${b},${alpha})`
+}
+
+function floatTo16BitPCM(input: Float32Array): Int16Array {
+    const output = new Int16Array(input.length)
+    for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]))
+        output[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff)
+    }
+    return output
+}
+
+function audioBufferToMp3(buffer: AudioBuffer): Blob {
+    const numChannels = buffer.numberOfChannels
+    const sampleRate = buffer.sampleRate
+    const mp3encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, MP3_BITRATE)
+    const mp3Data: Uint8Array[] = []
+    const left = buffer.getChannelData(0)
+    const right = numChannels > 1 ? buffer.getChannelData(1) : left
+
+    for (let i = 0; i < buffer.length; i += MP3_BLOCK_SIZE) {
+        const leftChunk = floatTo16BitPCM(left.subarray(i, i + MP3_BLOCK_SIZE))
+        const rightChunk = numChannels > 1
+            ? floatTo16BitPCM(right.subarray(i, i + MP3_BLOCK_SIZE))
+            : leftChunk
+        const mp3buf = numChannels > 1
+            ? mp3encoder.encodeBuffer(leftChunk, rightChunk)
+            : mp3encoder.encodeBuffer(leftChunk)
+        if (mp3buf.length > 0) mp3Data.push(new Uint8Array(mp3buf))
+    }
+
+    const end = mp3encoder.flush()
+    if (end.length > 0) mp3Data.push(new Uint8Array(end))
+    return new Blob(mp3Data, { type: "audio/mpeg" })
+}
+
+function getTotalDurationS(notes: ParsedNote[]): number {
+    return notes.reduce((max, note) => Math.max(max, note.timeS + note.durationS), 0)
+}
+
+function triggerDownload(url: string, filename: string) {
+    const link = document.createElement("a")
+    link.href = url
+    link.download = filename
+    link.rel = "noreferrer"
+    link.style.display = "none"
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+}
+
+function createSynth(Tone: ToneNamespace) {
+    const synth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "triangle" },
+        envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 0.4 },
+        volume: -12,
+    })
+    synth.toDestination()
+    return synth
+}
+
+async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
+    const Tone = await import("tone")
+    const totalS = getTotalDurationS(notes)
+    const renderDurationS = Math.max(totalS + MP3_TAIL_S, 0.25)
+    const events = notes.map(note => ({
+        time: note.timeS,
+        duration: Math.max(note.durationS, 0.05),
+        midi: note.midi,
+        velocity: Math.min(Math.max(note.velocity, 0.1), 1),
+    }))
+
+    return Tone.Offline(({ transport }) => {
+        const synth = createSynth(Tone)
+        new Tone.Part((time, value) => {
+            synth.triggerAttackRelease(
+                Tone.Frequency(value.midi, "midi").toNote(),
+                value.duration,
+                time,
+                value.velocity
+            )
+        }, events).start(0)
+        transport.start(0)
+    }, renderDurationS)
 }
 
 function isBlack(midi: number) { return BLACK_KEYS.has(midi % 12) }
@@ -120,6 +210,9 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
     const [progress, setProgress] = useState(0)
     const [durationMs, setDurationMs] = useState(0)
     const [errorMsg, setErrorMsg] = useState<string | null>(null)
+    const [mp3Url, setMp3Url] = useState<string | null>(null)
+    const [isConverting, setIsConverting] = useState(false)
+    const [convertError, setConvertError] = useState<string | null>(null)
 
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const containerRef = useRef<HTMLDivElement>(null)
@@ -130,12 +223,25 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
     const rafRef = useRef<number>(0)
     const progressRef = useRef(0)
     progressRef.current = progress
+    const autoDownloadRef = useRef(false)
+    const autoConvertRef = useRef(false)
+    const mountedRef = useRef(true)
+
+    useEffect(() => () => {
+        mountedRef.current = false
+    }, [])
 
     useEffect(() => {
         const controller = new AbortController()
         setStatus("loading")
         setProgress(0)
-        setIsPlaying(false);
+        setIsPlaying(false)
+        setErrorMsg(null)
+        setMp3Url(null)
+        setIsConverting(false)
+        setConvertError(null)
+        autoDownloadRef.current = false
+        autoConvertRef.current = false
 
         (async () => {
             try {
@@ -147,7 +253,12 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                 const notes: ParsedNote[] = []
                 for (const track of midi.tracks) {
                     for (const note of track.notes) {
-                        notes.push({ midi: note.midi, timeS: note.time, durationS: note.duration })
+                        notes.push({
+                            midi: note.midi,
+                            timeS: note.time,
+                            durationS: note.duration,
+                            velocity: note.velocity ?? 0.8,
+                        })
                     }
                 }
                 if (notes.length === 0) throw new Error("No notes found in MIDI file")
@@ -164,6 +275,42 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
 
         return () => { controller.abort() }
     }, [midiUrl])
+
+    useEffect(() => () => {
+        if (mp3Url) URL.revokeObjectURL(mp3Url)
+    }, [mp3Url])
+
+    const convertToMp3 = useCallback(async (autoDownload: boolean) => {
+        if (isConverting || notesRef.current.length === 0) return
+        setIsConverting(true)
+        setConvertError(null)
+
+        try {
+            const buffer = await renderMidiToBuffer(notesRef.current)
+            if (!mountedRef.current) return
+            const blob = audioBufferToMp3(buffer)
+            if (!mountedRef.current) return
+            const nextUrl = URL.createObjectURL(blob)
+            setMp3Url(nextUrl)
+            if (autoDownload && !autoDownloadRef.current) {
+                triggerDownload(nextUrl, MP3_FILENAME)
+                autoDownloadRef.current = true
+            }
+        } catch (e: unknown) {
+            if (!mountedRef.current) return
+            setConvertError(e instanceof Error ? e.message : "Failed to render MP3")
+        } finally {
+            if (mountedRef.current) setIsConverting(false)
+        }
+    }, [isConverting])
+
+    useEffect(() => {
+        if (status !== "ready") return
+        if (autoConvertRef.current) return
+        if (notesRef.current.length === 0) return
+        autoConvertRef.current = true
+        void convertToMp3(true)
+    }, [status, midiUrl, convertToMp3])
 
     // Effect 2: Draw piano roll when ready, and on resize
     const redraw = useCallback(() => {
@@ -406,6 +553,60 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                             <MatIcon name={isPlaying ? "pause" : "play_arrow"} size="1.4rem" />
                         </motion.button>
 
+                    </div>
+
+                    <div
+                        className="flex items-center justify-between gap-3 px-6 pb-5"
+                        style={{ borderTop: "1px solid rgba(167,100,255,0.08)" }}
+                    >
+                        <div className="flex items-center gap-2">
+                            <span className="monoSm text-violet">MP3 Export</span>
+                            {isConverting && (
+                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>RENDERING...</span>
+                            )}
+                            {convertError && (
+                                <span className="monoSm" style={{ color: "rgba(255,80,80,0.7)" }}>{convertError}</span>
+                            )}
+                            {mp3Url && !isConverting && !convertError && (
+                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>READY</span>
+                            )}
+                        </div>
+
+                        {mp3Url ? (
+                            <motion.a
+                                href={mp3Url}
+                                download={MP3_FILENAME}
+                                whileHover={{ scale: 1.06 }}
+                                whileTap={{ scale: 0.94 }}
+                                className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm"
+                                style={{
+                                    border: "1px solid rgba(0,219,233,0.55)",
+                                    color: "rgba(0,219,233,0.85)",
+                                    background: "rgba(0,219,233,0.08)",
+                                }}
+                            >
+                                <MatIcon name="download" size="0.9rem" />
+                                DOWNLOAD MP3
+                            </motion.a>
+                        ) : (
+                            <motion.button
+                                onClick={() => convertToMp3(true)}
+                                whileHover={isConverting ? {} : { scale: 1.04 }}
+                                whileTap={isConverting ? {} : { scale: 0.96 }}
+                                className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm"
+                                style={{
+                                    border: "1px solid rgba(167,100,255,0.55)",
+                                    color: "rgba(167,100,255,0.85)",
+                                    background: "rgba(167,100,255,0.08)",
+                                    opacity: isConverting ? 0.6 : 1,
+                                    cursor: isConverting ? "default" : "pointer",
+                                }}
+                                disabled={isConverting}
+                            >
+                                <MatIcon name="graphic_eq" size="0.9rem" />
+                                {convertError ? "RETRY MP3" : "EXPORT MP3"}
+                            </motion.button>
+                        )}
                     </div>
                 </>
             )}
