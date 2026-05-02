@@ -40,3 +40,7 @@ This is a single-page audio recorder app. All logic lives in `app/page.tsx` as a
 - Inline `style` objects are used for fine-grained opacity control alongside Tailwind classes.
 - Fonts: **Manrope** (`font-body-md`) for body text, **Space Grotesk** (`font-label-*`, `font-headline-*`) for labels, **Courier New** (inline) for monospace clip labels/timers.
 - Material Symbols Outlined icons are loaded via Google Fonts in `layout.tsx` — use `<span className="material-symbols-outlined">icon_name</span>`.
+
+## Project Description
+
+This is the front end portion of an app where you can upload audio clips, the backend will parse the audio files and create a beat using the provided audio clips
