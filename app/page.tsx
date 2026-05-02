@@ -12,6 +12,7 @@ import { ResultScreen } from "@/components/ResultScreen"
 import GeneratingScreen from "@/components/GenerationScreen"
 import BeatPromptScreen from "@/components/BeatPromptScreen"
 import type { Clip } from "@/lib/audio"
+import { segmentAudio } from "@/lib/segmenter"
 
 type AppStatus = "idle" | "prompting" | "generating" | "done"
 
@@ -52,6 +53,18 @@ export default function Home() {
         setAppStatus("prompting")
     }
 
+    const playSegmentsInSuccession = async (blobs: Blob[]) => {
+        for (const blob of blobs) {
+            const url = URL.createObjectURL(blob)
+            await new Promise<void>((resolve) => {
+                const audio = new Audio(url)
+                audio.onended = () => { URL.revokeObjectURL(url); resolve() }
+                audio.onerror = () => { URL.revokeObjectURL(url); resolve() }
+                audio.play().catch(() => resolve())
+            })
+        }
+    }
+
     const handleCreateBeat = async (style: string, additional: string) => {
         setAppStatus("generating")
 
@@ -59,13 +72,19 @@ export default function Home() {
             const formData = new FormData()
             formData.append("prompt", "The style is: " + style + ". " + additional)
 
-            await Promise.all(
-                clipsRef.current.map(async (clip, i) => {
+            const blobs = await Promise.all(
+                clipsRef.current.map(async (clip) => {
                     const res = await fetch(clip.url)
-                    const blob = await res.blob()
-                    formData.append("clips", blob, `clip_${i}.webm`)
+                    return res.blob()
                 })
             )
+
+            // Segment all clips and play detected sounds in succession (for preview)
+            Promise.all(blobs.map(b => segmentAudio(b)))
+                .then(allSegments => playSegmentsInSuccession(allSegments.flat()))
+                .catch(() => {})
+
+            blobs.forEach((blob, i) => formData.append("clips", blob, `clip_${i}.webm`))
 
             const res = await fetch("/api/generate", { method: "POST", body: formData })
 
