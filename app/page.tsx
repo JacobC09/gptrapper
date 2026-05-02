@@ -52,13 +52,33 @@ export default function Home() {
         setAppStatus("prompting")
     }
 
-    const handleBeatConfirm = async (_style: string, _additional: string) => {
+    const handleCreateBeat = async (style: string, additional: string) => {
         setAppStatus("generating")
-        // await new Promise<void>(resolve => setTimeout(resolve, 4500))
-        await new Promise<void>(resolve => setTimeout(resolve, 1000))
-        setResultUrl(clipsRef.current[0]?.url ?? null)
-        setAppStatus("done")
-        toast("Beat generated!", { duration: 2000 })
+
+        try {
+            const formData = new FormData()
+            formData.append("prompt", "The style is: " + style + ". " + additional)
+
+            await Promise.all(
+                clipsRef.current.map(async (clip, i) => {
+                    const res = await fetch(clip.url)
+                    const blob = await res.blob()
+                    formData.append("clips", blob, `clip_${i}.webm`)
+                })
+            )
+
+            const res = await fetch("/api/generate", { method: "POST", body: formData })
+
+            if (!res.ok) throw new Error(`Server responded ${res.status}`)
+
+            const blob = await res.blob()
+            setResultUrl(URL.createObjectURL(blob))
+            setAppStatus("done")
+            toast("Beat generated!", { duration: 2000 })
+        } catch {
+            toast("Failed to generate beat", { duration: 2000 })
+            setAppStatus("idle")
+        }
     }
 
     const handleReset = () => {
@@ -153,7 +173,7 @@ export default function Home() {
                         </motion.div>
                     )}
 
-                    {appStatus === "prompting" && <BeatPromptScreen key="prompting" onConfirm={handleBeatConfirm} />}
+                    {appStatus === "prompting" && <BeatPromptScreen key="prompting" onConfirm={handleCreateBeat} />}
 
                     {appStatus === "generating" && <GeneratingScreen key="generating" />}
 

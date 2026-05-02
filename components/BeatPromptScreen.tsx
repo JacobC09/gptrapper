@@ -70,7 +70,7 @@ export default function BeatPromptScreen({ onConfirm }: { onConfirm: (style: str
                             <motion.span
                                 className="material-symbols-outlined"
                                 animate={{
-                                    color: selected === preset.id ? "rgba(var(--c-violet),0.9)" : "rgba(var(--c-cyan),0.4)",
+                                    color: selected === preset.id ? "rgba(167,100,255,0.9)" : "rgba(0,219,233,0.4)",
                                 }}
                                 transition={{ duration: 0.2 }}
                                 style={{ fontSize: "1.6rem", fontVariationSettings: "'FILL' 1" }}
@@ -80,7 +80,7 @@ export default function BeatPromptScreen({ onConfirm }: { onConfirm: (style: str
                         <motion.span
                             className="uppercase tracking-[0.14em] monoSm text-center leading-tight"
                             animate={{
-                                color: selected === preset.id ? "rgba(var(--c-violet),0.95)" : "rgba(var(--c-cyan),0.6)",
+                                color: selected === preset.id ? "rgba(167,100,255,0.95)" : "rgba(0,219,233,0.6)",
                             }}
                             transition={{ duration: 0.2 }}
                         >
