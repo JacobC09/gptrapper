@@ -18,7 +18,7 @@ const spaceGrotesk = Space_Grotesk({
 
 export const metadata: Metadata = {
     title: "GPT wRAPPER",
-    description: "Precision Audio Capture",
+    description: "EurekaHacks",
 };
 
 export default function RootLayout({

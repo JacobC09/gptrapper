@@ -8,6 +8,16 @@ button:hover {
     cursor: pointer;
 }
 
+@utility monoSm {
+    font: 10px/1 'Courier New', monospace; 
+    letter-spacing: 0.12em;
+}
+
+@utility monoMd {
+    font: 11px/1 'Courier New', monospace; 
+    letter-spacing: 0.1em;
+}
+
 @theme {
   --color-background: #121318;
   --color-on-background: #e3e2e9;
@@ -28,6 +38,9 @@ button:hover {
   --color-inverse-surface: #e3e2e9;
   --color-inverse-on-surface: #2f3035;
   --color-inverse-primary: #006970;
+
+  --color-violet: #a764ff;
+  --color-red-accent: #ff5050;
 
   --color-primary: #dbfcff;
   --color-primary-container: #00f0ff;
@@ -135,6 +148,10 @@ button:hover {
 }
 
 :root {
+    --c-cyan: 0, 219, 233;
+    --c-violet: 167, 100, 255;
+    --c-red: 255, 80, 80;
+
     --background: oklch(1 0 0);
     --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
