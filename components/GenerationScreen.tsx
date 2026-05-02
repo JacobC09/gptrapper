@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { BAR_COUNT } from "@/lib/audio";
 
-const GENERATING_STAGES = [
+const AI_STAGES = [
     "ANALYZING SAMPLES",
     "BUILDING RHYTHM GRID",
     "COMPOSING MELODY",
@@ -12,7 +12,16 @@ const GENERATING_STAGES = [
     "FINALIZING BEAT",
 ] as const
 
-export default function GeneratingScreen() {
+const SAMPLE_STAGES = [
+    "LOADING VOICES",
+    "MATCHING TO MIDI",
+    "PITCH SHIFTING",
+    "MIXING TRACKS",
+    "FINALIZING BEAT",
+] as const
+
+export default function GeneratingScreen({ mode = "ai" }: { mode?: "ai" | "sample" }) {
+    const GENERATING_STAGES = mode === "sample" ? SAMPLE_STAGES : AI_STAGES
     const [stageIdx, setStageIdx] = useState(0)
     const [barAnims] = useState(() =>
         Array.from({ length: BAR_COUNT }, () => ({
@@ -26,7 +35,7 @@ export default function GeneratingScreen() {
     useEffect(() => {
         const id = setInterval(() => {
             setStageIdx(prev => (prev < GENERATING_STAGES.length - 1 ? prev + 1 : prev))
-        }, 900)
+        }, 1200)
         return () => clearInterval(id)
     }, [])
 

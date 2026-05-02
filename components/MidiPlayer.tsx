@@ -2,178 +2,111 @@
 
 import React, { useState, useRef, useEffect, useCallback } from "react"
 import { motion } from "motion/react"
-import { formatTime } from "@/lib/audio"
+import { formatTime, parseMidiNotes } from "@/lib/audio"
+import type { ParsedNote } from "@/lib/audio"
 import { MatIcon } from "@/components/MatIcon"
-import lamejs from "lamejs"
-
-type ToneNamespace = typeof import("tone")
-
-type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number }
 
 type RollLayout = {
-    minPitch: number
-    maxPitch: number
     totalS: number
     W: number
     H: number
     rowH: number
     dpr: number
+    pitchToRow: Map<number, number>
+    numRows: number
 }
 
-const BLACK_KEYS = new Set([1, 3, 6, 8, 10])
-const CANVAS_HEIGHT_PX = 320
-const PITCH_PAD = 2
-const DIM_ALPHA = 0.3
-const MP3_BITRATE = 192
-const MP3_BLOCK_SIZE = 1152
-const MP3_FILENAME = "generated_beat.mp3"
-const MP3_TAIL_S = 0.6
-
-const PITCH_COLORS: [number, number, number][] = [
-    [0,   219, 233],   // Primary cyan
-    [100, 150, 255],   // Light blue
-    [180,  80, 255],   // Purple
-    [255,  60, 180],   // Magenta
-]
+const CANVAS_HEIGHT_PX = 500
+const DIM_ALPHA = 0.28
 
 type RollSnapshots = { dim: HTMLCanvasElement; bright: HTMLCanvasElement }
 
-function noteColor(midi: number, alpha: number): string {
-    const [r, g, b] = PITCH_COLORS[midi % PITCH_COLORS.length]
+// Gradient: cyan → blue → purple → pink across all rows (top = high pitch)
+function rowColor(rowIndex: number, numRows: number, alpha: number): string {
+    const t = numRows > 1 ? rowIndex / (numRows - 1) : 0.5
+    const stops: Array<[number, [number, number, number]]> = [
+        [0,    [0,   219, 233]],
+        [0.35, [80,  140, 255]],
+        [0.65, [167, 100, 255]],
+        [1.0,  [255,  60, 180]],
+    ]
+    let i = stops.findIndex(([s]) => t <= s)
+    if (i <= 0) i = 1
+    const [t0, c0] = stops[i - 1]
+    const [t1, c1] = stops[i]
+    const s = (t1 - t0) > 0 ? (t - t0) / (t1 - t0) : 0
+    const r = Math.round(c0[0] + s * (c1[0] - c0[0]))
+    const g = Math.round(c0[1] + s * (c1[1] - c0[1]))
+    const b = Math.round(c0[2] + s * (c1[2] - c0[2]))
     return `rgba(${r},${g},${b},${alpha})`
 }
 
-function floatTo16BitPCM(input: Float32Array): Int16Array {
-    const output = new Int16Array(input.length)
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]))
-        output[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff)
-    }
-    return output
-}
-
-function audioBufferToMp3(buffer: AudioBuffer): Blob {
-    const numChannels = buffer.numberOfChannels
-    const sampleRate = buffer.sampleRate
-    const mp3encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, MP3_BITRATE)
-    const mp3Data: Uint8Array[] = []
-    const left = buffer.getChannelData(0)
-    const right = numChannels > 1 ? buffer.getChannelData(1) : left
-
-    for (let i = 0; i < buffer.length; i += MP3_BLOCK_SIZE) {
-        const leftChunk = floatTo16BitPCM(left.subarray(i, i + MP3_BLOCK_SIZE))
-        const rightChunk = numChannels > 1
-            ? floatTo16BitPCM(right.subarray(i, i + MP3_BLOCK_SIZE))
-            : leftChunk
-        const mp3buf = numChannels > 1
-            ? mp3encoder.encodeBuffer(leftChunk, rightChunk)
-            : mp3encoder.encodeBuffer(leftChunk)
-        if (mp3buf.length > 0) mp3Data.push(new Uint8Array(mp3buf))
-    }
-
-    const end = mp3encoder.flush()
-    if (end.length > 0) mp3Data.push(new Uint8Array(end))
-    return new Blob(mp3Data, { type: "audio/mpeg" })
-}
-
-function getTotalDurationS(notes: ParsedNote[]): number {
-    return notes.reduce((max, note) => Math.max(max, note.timeS + note.durationS), 0)
-}
-
-function triggerDownload(url: string, filename: string) {
-    const link = document.createElement("a")
-    link.href = url
-    link.download = filename
-    link.rel = "noreferrer"
-    link.style.display = "none"
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-}
-
-function createSynth(Tone: ToneNamespace) {
-    const synth = new Tone.PolySynth(Tone.Synth, {
-        oscillator: { type: "triangle" },
-        envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 0.4 },
-        volume: -12,
-    })
-    synth.toDestination()
-    return synth
-}
-
-async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
-    const Tone = await import("tone")
-    const totalS = getTotalDurationS(notes)
-    const renderDurationS = Math.max(totalS + MP3_TAIL_S, 0.25)
-    const events = notes.map(note => ({
-        time: note.timeS,
-        duration: Math.max(note.durationS, 0.05),
-        midi: note.midi,
-        velocity: Math.min(Math.max(note.velocity, 0.1), 1),
-    }))
-
-    return Tone.Offline(({ transport }) => {
-        const synth = createSynth(Tone)
-        new Tone.Part((time, value) => {
-            synth.triggerAttackRelease(
-                Tone.Frequency(value.midi, "midi").toNote(),
-                value.duration,
-                time,
-                value.velocity
-            )
-        }, events).start(0)
-        transport.start(0)
-    }, renderDurationS)
-}
-
-function isBlack(midi: number) { return BLACK_KEYS.has(midi % 12) }
-
 function paintNotes(ctx: CanvasRenderingContext2D, notes: ParsedNote[], layout: RollLayout, alphaScale: number) {
-    const { W, rowH, maxPitch, totalS } = layout
+    const { W, rowH, totalS, pitchToRow, numRows } = layout
     for (const note of notes) {
+        const row = pitchToRow.get(note.midi) ?? 0
         const x = (note.timeS / totalS) * W
-        const y = (maxPitch - note.midi) * rowH + 1.5
-        const w = Math.max((note.durationS / totalS) * W, 4)
-        const h = Math.max(rowH - 3, 4)
-        const r = Math.min(h / 2, w / 2, 4)
+        const y = row * rowH + 2
+        const w = Math.max((note.durationS / totalS) * W, 6)
+        const h = Math.max(rowH - 4, 6)
+        const rad = Math.min(h / 2, w / 2, 5)
+        const col = rowColor(row, numRows, alphaScale)
+        const glow = rowColor(row, numRows, 0.7 * alphaScale)
 
         ctx.save()
-        ctx.shadowBlur = 10
-        ctx.shadowColor = noteColor(note.midi, 0.65 * alphaScale)
-        ctx.fillStyle = noteColor(note.midi, 0.48 * alphaScale)
+        ctx.shadowBlur = 18
+        ctx.shadowColor = glow
+        ctx.fillStyle = rowColor(row, numRows, 0.55 * alphaScale)
         ctx.beginPath()
-        ctx.roundRect(x, y, w, h, r)
+        ctx.roundRect(x, y, w, h, rad)
         ctx.fill()
         ctx.restore()
 
+        // top-edge highlight shimmer
         ctx.save()
         ctx.beginPath()
-        ctx.roundRect(x, y, w, h, r)
+        ctx.roundRect(x, y, w, h, rad)
         ctx.clip()
-        ctx.fillStyle = noteColor(note.midi, 0.5 * alphaScale)
-        ctx.fillRect(x, y, w, Math.max(h * 0.28, 2))
+        ctx.fillStyle = col
+        ctx.globalAlpha = 0.45 * alphaScale
+        ctx.fillRect(x, y, w, Math.max(h * 0.3, 3))
         ctx.restore()
     }
 }
 
 function drawRoll(canvas: HTMLCanvasElement, notes: ParsedNote[], layout: RollLayout): RollSnapshots {
-    const { W, H, rowH, minPitch, maxPitch } = layout
+    const { W, H, rowH, numRows, totalS } = layout
 
     function makeSnapshot(alphaScale: number): HTMLCanvasElement {
         const c = document.createElement("canvas")
         c.width = W; c.height = H
         const cctx = c.getContext("2d")!
-        cctx.fillStyle = "rgba(10,10,16,0.8)"
+
+        // Background
+        cctx.fillStyle = "rgba(8,8,14,0.92)"
         cctx.fillRect(0, 0, W, H)
-        for (let p = minPitch; p <= maxPitch; p++) {
-            const y = (maxPitch - p) * rowH
-            if (isBlack(p)) {
-                cctx.fillStyle = "rgba(0,0,0,0.18)"
+
+        // Row lanes with alternating subtle tint
+        for (let row = 0; row < numRows; row++) {
+            const y = row * rowH
+            if (row % 2 === 1) {
+                cctx.fillStyle = "rgba(255,255,255,0.018)"
                 cctx.fillRect(0, y, W, rowH)
             }
-            cctx.fillStyle = "rgba(255,255,255,0.03)"
+            // Row separator
+            cctx.fillStyle = "rgba(255,255,255,0.04)"
             cctx.fillRect(0, y + rowH - 1, W, 1)
         }
+
+        // Vertical beat grid — 8 divisions
+        const numDivs = 8
+        for (let i = 1; i < numDivs; i++) {
+            const x = Math.round((i / numDivs) * W)
+            const isMajor = i % 2 === 0
+            cctx.fillStyle = isMajor ? "rgba(255,255,255,0.055)" : "rgba(255,255,255,0.025)"
+            cctx.fillRect(x, 0, 1, H)
+        }
+
         paintNotes(cctx, notes, layout, alphaScale)
         return c
     }
@@ -197,74 +130,51 @@ function drawPlayhead(ctx: CanvasRenderingContext2D, snapshots: RollSnapshots, l
         ctx.restore()
     }
     ctx.save()
-    ctx.shadowBlur = 8
-    ctx.shadowColor = "rgba(0,219,233,0.7)"
-    ctx.fillStyle = "rgba(0,219,233,0.9)"
-    ctx.fillRect(playedW, 0, 1.5, layout.H)
+    ctx.shadowBlur = 16
+    ctx.shadowColor = "rgba(0,219,233,0.9)"
+    ctx.fillStyle = "rgba(0,219,233,0.95)"
+    ctx.fillRect(playedW, 0, 2, layout.H)
     ctx.restore()
 }
 
-export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
+export function MidiPlayer({ midiUrl, audioUrl }: { midiUrl: string; audioUrl?: string }) {
     const [status, setStatus] = useState<"loading" | "ready" | "error">("loading")
     const [isPlaying, setIsPlaying] = useState(false)
     const [progress, setProgress] = useState(0)
     const [durationMs, setDurationMs] = useState(0)
     const [errorMsg, setErrorMsg] = useState<string | null>(null)
-    const [mp3Url, setMp3Url] = useState<string | null>(null)
-    const [isConverting, setIsConverting] = useState(false)
-    const [convertError, setConvertError] = useState<string | null>(null)
 
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const containerRef = useRef<HTMLDivElement>(null)
+    const audioRef = useRef<HTMLAudioElement>(null)
     const notesRef = useRef<ParsedNote[]>([])
     const rollLayoutRef = useRef<RollLayout | null>(null)
     const snapshotRef = useRef<RollSnapshots | null>(null)
-    const synthRef = useRef<unknown>(null)
     const rafRef = useRef<number>(0)
     const progressRef = useRef(0)
+    const audioDurationSRef = useRef(0)
     progressRef.current = progress
-    const autoDownloadRef = useRef(false)
-    const autoConvertRef = useRef(false)
-    const mountedRef = useRef(true)
 
-    useEffect(() => () => {
-        mountedRef.current = false
-    }, [])
-
+    // Parse MIDI for the piano roll visualization
     useEffect(() => {
         const controller = new AbortController()
         setStatus("loading")
         setProgress(0)
         setIsPlaying(false)
         setErrorMsg(null)
-        setMp3Url(null)
-        setIsConverting(false)
-        setConvertError(null)
-        autoDownloadRef.current = false
-        autoConvertRef.current = false
 
-        (async () => {
+        void (async () => {
             try {
                 const res = await fetch(midiUrl, { signal: controller.signal })
                 if (!res.ok) throw new Error(`HTTP ${res.status}`)
                 const buf = await res.arrayBuffer()
-                const { Midi } = await import("@tonejs/midi")
-                const midi = new Midi(buf)
-                const notes: ParsedNote[] = []
-                for (const track of midi.tracks) {
-                    for (const note of track.notes) {
-                        notes.push({
-                            midi: note.midi,
-                            timeS: note.time,
-                            durationS: note.duration,
-                            velocity: note.velocity ?? 0.8,
-                        })
-                    }
-                }
+                const notes = await parseMidiNotes(buf)
                 if (notes.length === 0) throw new Error("No notes found in MIDI file")
-                const totalDuration = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
                 notesRef.current = notes
-                setDurationMs(totalDuration * 1000)
+                if (!audioUrl) {
+                    const totalDuration = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
+                    setDurationMs(totalDuration * 1000)
+                }
                 setStatus("ready")
             } catch (e: unknown) {
                 if (e instanceof Error && e.name === "AbortError") return
@@ -274,76 +184,65 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         })()
 
         return () => { controller.abort() }
-    }, [midiUrl])
+    }, [midiUrl, audioUrl])
 
-    useEffect(() => () => {
-        if (mp3Url) URL.revokeObjectURL(mp3Url)
-    }, [mp3Url])
-
-    const convertToMp3 = useCallback(async (autoDownload: boolean) => {
-        if (isConverting || notesRef.current.length === 0) return
-        setIsConverting(true)
-        setConvertError(null)
-
-        try {
-            const buffer = await renderMidiToBuffer(notesRef.current)
-            if (!mountedRef.current) return
-            const blob = audioBufferToMp3(buffer)
-            if (!mountedRef.current) return
-            const nextUrl = URL.createObjectURL(blob)
-            setMp3Url(nextUrl)
-            if (autoDownload && !autoDownloadRef.current) {
-                triggerDownload(nextUrl, MP3_FILENAME)
-                autoDownloadRef.current = true
-            }
-        } catch (e: unknown) {
-            if (!mountedRef.current) return
-            setConvertError(e instanceof Error ? e.message : "Failed to render MP3")
-        } finally {
-            if (mountedRef.current) setIsConverting(false)
-        }
-    }, [isConverting])
-
-    useEffect(() => {
-        if (status !== "ready") return
-        if (autoConvertRef.current) return
-        if (notesRef.current.length === 0) return
-        autoConvertRef.current = true
-        void convertToMp3(true)
-    }, [status, midiUrl, convertToMp3])
-
-    // Effect 2: Draw piano roll when ready, and on resize
+    // Draw piano roll on ready / resize
     const redraw = useCallback(() => {
         const canvas = canvasRef.current
         const container = containerRef.current
         if (!canvas || !container || notesRef.current.length === 0) return
         const dpr = window.devicePixelRatio || 1
         const cssW = container.offsetWidth
-        const cssH = CANVAS_HEIGHT_PX
         const W = Math.round(cssW * dpr)
-        const H = Math.round(cssH * dpr)
+        const H = Math.round(CANVAS_HEIGHT_PX * dpr)
         canvas.width = W
         canvas.height = H
         canvas.style.width = `${cssW}px`
-        canvas.style.height = `${cssH}px`
+        canvas.style.height = `${CANVAS_HEIGHT_PX}px`
 
         const notes = notesRef.current
-        const minPitch = notes.reduce((m, n) => Math.min(m, n.midi), 127) - PITCH_PAD
-        const maxPitch = notes.reduce((m, n) => Math.max(m, n.midi), 0) + PITCH_PAD
-        const pitchRange = maxPitch - minPitch + 1
-        const rowH = H / pitchRange
-        const totalS = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
 
-        const layout: RollLayout = { minPitch, maxPitch, totalS, W, H, rowH, dpr }
+        // Sparse layout: only allocate rows for pitches that have at least one note.
+        // Sort descending so row 0 = highest pitch (top of canvas).
+        const uniquePitches = [...new Set(notes.map(n => n.midi))].sort((a, b) => b - a)
+        const pitchToRow = new Map(uniquePitches.map((p, i) => [p, i]))
+        const numRows = Math.max(uniquePitches.length, 1)
+        const rowH = H / numRows
+
+        const midiTotalS = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
+        // Use the WAV duration as the timeline reference so note positions stay in sync with audio playback
+        const totalS = audioUrl && audioDurationSRef.current > 0 ? audioDurationSRef.current : midiTotalS
+
+        const layout: RollLayout = { totalS, W, H, rowH, dpr, pitchToRow, numRows }
         rollLayoutRef.current = layout
         snapshotRef.current = drawRoll(canvas, notes, layout)
 
-        // Restore playhead if mid-song
         if (progressRef.current > 0) {
             const ctx = canvas.getContext("2d")!
             drawPlayhead(ctx, snapshotRef.current, layout, progressRef.current)
         }
-    }, [])
+    }, [audioUrl])
+
+    // Get duration from audio element when audioUrl is provided.
+    // Runs after status="ready" so the <audio> element is in the DOM.
+    useEffect(() => {
+        if (!audioUrl || status !== "ready") return
+        const audio = audioRef.current
+        if (!audio) return
+        const onMeta = () => {
+            audioDurationSRef.current = audio.duration
+            setDurationMs(audio.duration * 1000)
+            // Re-draw now that we know the real audio duration so note positions align
+            redraw()
+        }
+        audio.addEventListener("loadedmetadata", onMeta)
+        if (!isNaN(audio.duration) && audio.duration > 0) {
+            audioDurationSRef.current = audio.duration
+            setDurationMs(audio.duration * 1000)
+            redraw()
+        }
+        return () => audio.removeEventListener("loadedmetadata", onMeta)
+    }, [audioUrl, status, redraw])
 
     useEffect(() => {
         if (status !== "ready") return
@@ -353,7 +252,7 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         return () => observer.disconnect()
     }, [status, redraw])
 
-    // Effect 3: rAF playhead loop
+    // rAF playhead loop
     useEffect(() => {
         if (!isPlaying) {
             cancelAnimationFrame(rafRef.current)
@@ -362,92 +261,101 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         const canvas = canvasRef.current
         if (!canvas) return
 
-        async function tick() {
-            const Tone = await import("tone")
+        const tick = () => {
             const layout = rollLayoutRef.current
             const snapshot = snapshotRef.current
-            if (!layout || !snapshot || !canvas) return
+            if (!layout || !snapshot) return
             const ctx = canvas.getContext("2d")!
-            const pos = Tone.getTransport().seconds / layout.totalS
+
+            let pos: number
+            if (audioUrl && audioRef.current) {
+                const audio = audioRef.current
+                pos = audio.duration ? audio.currentTime / audio.duration : 0
+            } else {
+                // Tone.js path (unused when audioUrl is set)
+                pos = progressRef.current
+            }
+
             const clamped = Math.min(pos, 1)
             setProgress(clamped)
             drawPlayhead(ctx, snapshot, layout, clamped)
+
             if (clamped < 1) {
                 rafRef.current = requestAnimationFrame(tick)
             } else {
                 setIsPlaying(false)
                 setProgress(0)
-                Tone.getTransport().stop()
-                Tone.getTransport().seconds = 0
-                // Redraw without playhead
-                snapshotRef.current && ctx.drawImage(snapshotRef.current.dim, 0, 0)
+                snapshot && ctx.drawImage(snapshot.dim, 0, 0)
             }
         }
 
         rafRef.current = requestAnimationFrame(tick)
         return () => cancelAnimationFrame(rafRef.current)
-    }, [isPlaying])
+    }, [isPlaying, audioUrl])
 
-    // Effect 4: Teardown
+    // Teardown
     useEffect(() => {
         return () => {
             cancelAnimationFrame(rafRef.current)
-            import("tone").then(Tone => {
-                Tone.getTransport().stop()
-                Tone.getTransport().cancel()
-            })
-            const s = synthRef.current as { dispose?: () => void } | null
-            s?.dispose?.()
-            synthRef.current = null
+            if (!audioUrl) {
+                import("tone").then(Tone => {
+                    try {
+                        Tone.getTransport().stop()
+                        Tone.getTransport().cancel()
+                    } catch { /* already torn down */ }
+                })
+            }
         }
-    }, [])
+    }, [audioUrl])
 
     const startPlayback = async () => {
-        if (typeof window === "undefined") return
         const layout = rollLayoutRef.current
         if (!layout) return
 
-        const Tone = await import("tone")
-        await Tone.start()
-
-        if (!synthRef.current) {
-            const synth = new Tone.PolySynth(Tone.Synth, {
-                oscillator: { type: "triangle" },
-                envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 0.4 },
-                volume: -12,
-            })
-            synth.toDestination()
-            synthRef.current = synth
+        if (audioUrl && audioRef.current) {
+            const audio = audioRef.current
+            audio.currentTime = progressRef.current * audio.duration
+            await audio.play()
+            setIsPlaying(true)
+            return
         }
 
+        // Tone.js fallback (no audioUrl)
+        const Tone = await import("tone")
+        await Tone.start()
         const transport = Tone.getTransport()
         transport.cancel()
         transport.stop()
-
         const offsetS = progressRef.current * layout.totalS
         transport.seconds = offsetS
-
         const notes = notesRef.current
-        const synth = synthRef.current as InstanceType<typeof Tone.PolySynth>
-
+        const synth = new Tone.PolySynth(Tone.Synth, {
+            oscillator: { type: "triangle" },
+            envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 0.4 },
+            volume: -12,
+        })
+        synth.toDestination()
         for (const note of notes) {
             if (note.timeS + note.durationS <= offsetS) continue
             const startDelay = Math.max(note.timeS - offsetS, 0)
-            const noteStart = `+${startDelay}`
             transport.schedule((time) => {
                 synth.triggerAttackRelease(
                     Tone.Frequency(note.midi, "midi").toNote(),
                     Math.max(note.durationS - Math.max(offsetS - note.timeS, 0), 0.05),
                     time
                 )
-            }, noteStart)
+            }, `+${startDelay}`)
         }
-
         transport.start()
         setIsPlaying(true)
     }
 
     const pausePlayback = async () => {
+        if (audioUrl && audioRef.current) {
+            audioRef.current.pause()
+            setIsPlaying(false)
+            return
+        }
         const Tone = await import("tone")
         Tone.getTransport().pause()
         setIsPlaying(false)
@@ -464,7 +372,9 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         const ctx = canvas.getContext("2d")!
         drawPlayhead(ctx, snapshot, layout, ratio)
 
-        if (isPlaying) {
+        if (audioUrl && audioRef.current) {
+            audioRef.current.currentTime = ratio * audioRef.current.duration
+        } else if (isPlaying) {
             import("tone").then(Tone => {
                 Tone.getTransport().seconds = ratio * layout.totalS
             })
@@ -477,20 +387,20 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         <div
             className="w-full rounded-2xl overflow-hidden flex flex-col"
             style={{
-                background: "rgba(167,100,255,0.13)",
-                border: "1px solid rgba(167,100,255,0.18)",
-                boxShadow: "0 8px 40px rgba(167,100,255,0.10), 0 0 0 1px rgba(167,100,255,0.04) inset",
+                background: "rgba(10,8,18,0.96)",
+                border: "1px solid rgba(167,100,255,0.22)",
+                boxShadow: "0 12px 60px rgba(167,100,255,0.15), 0 0 0 1px rgba(167,100,255,0.06) inset, 0 0 120px rgba(0,219,233,0.04) inset",
             }}
         >
             <div
-                className="flex items-center justify-between px-6 py-4"
-                style={{ borderBottom: "1px solid rgba(167,100,255,0.08)" }}
+                className="flex items-center justify-between px-5 py-3"
+                style={{ borderBottom: "1px solid rgba(167,100,255,0.10)" }}
             >
                 <div className="flex items-center gap-2">
-                    <span className="monoMd text-violet">Generated Midi</span>
+                    <span className="monoSm uppercase tracking-[0.22em]" style={{ color: "rgba(167,100,255,0.5)", fontSize: "9px" }}>MIDI Roll</span>
                 </div>
                 {status === "ready" && (
-                    <span className="monoSm" style={{ color: "rgba(167,100,255)", fontSize: "10px" }}>
+                    <span className="monoSm" style={{ color: "rgba(167,100,255,0.55)", fontSize: "9px", letterSpacing: "0.12em" }}>
                         {formatTime(currentMs)}&thinsp;/&thinsp;{formatTime(durationMs)}
                     </span>
                 )}
@@ -522,6 +432,8 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
 
             {status === "ready" && (
                 <>
+                    {audioUrl && <audio ref={audioRef} src={audioUrl} preload="metadata" />}
+
                     <div
                         ref={containerRef}
                         className="relative cursor-crosshair w-full"
@@ -531,51 +443,36 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                     </div>
 
                     <div
-                        className="flex items-center justify-center px-6 py-4"
-                        style={{ borderTop: "1px solid rgba(0,219,233,0.06)" }}
-                    >
-
-
-                        <motion.button
-                            onClick={isPlaying ? pausePlayback : startPlayback}
-                            whileHover={{ scale: 1.08 }}
-                            whileTap={{ scale: 0.92 }}
-                            className="w-12 h-12 rounded-full flex items-center justify-center focus:outline-none"
-                            style={{
-                                background: isPlaying ? "rgba(255,80,80,0.10)" : "rgba(167,100,255,0.13)",
-                                border: isPlaying ? "1px solid rgba(255,80,80,0.45)" : "1px solid rgba(167,100,255,0.5)",
-                                boxShadow: isPlaying
-                                    ? "0 0 24px rgba(255,80,80,0.18), inset 0 1px 0 rgba(255,255,255,0.07)"
-                                    : "0 0 24px rgba(167,100,255,0.20), inset 0 1px 0 rgba(255,255,255,0.07)",
-                                color: isPlaying ? "rgba(255,110,110,0.9)" : "rgba(167,100,255,0.9)",
-                            }}
-                        >
-                            <MatIcon name={isPlaying ? "pause" : "play_arrow"} size="1.4rem" />
-                        </motion.button>
-
-                    </div>
-
-                    <div
-                        className="flex items-center justify-between gap-3 px-6 pb-5"
+                        className="flex items-center justify-center px-6 py-5"
                         style={{ borderTop: "1px solid rgba(167,100,255,0.08)" }}
                     >
-                        <div className="flex items-center gap-2">
-                            <span className="monoSm text-violet">MP3 Export</span>
-                            {isConverting && (
-                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>RENDERING...</span>
-                            )}
-                            {convertError && (
-                                <span className="monoSm" style={{ color: "rgba(255,80,80,0.7)" }}>{convertError}</span>
-                            )}
-                            {mp3Url && !isConverting && !convertError && (
-                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>READY</span>
-                            )}
-                        </div>
+                        <motion.button
+                            onClick={isPlaying ? pausePlayback : startPlayback}
+                            whileHover={{ scale: 1.1 }}
+                            whileTap={{ scale: 0.9 }}
+                            className="w-14 h-14 rounded-full flex items-center justify-center focus:outline-none"
+                            style={{
+                                background: isPlaying ? "rgba(255,80,80,0.10)" : "rgba(167,100,255,0.16)",
+                                border: isPlaying ? "1px solid rgba(255,80,80,0.5)" : "1px solid rgba(167,100,255,0.6)",
+                                boxShadow: isPlaying
+                                    ? "0 0 32px rgba(255,80,80,0.22), inset 0 1px 0 rgba(255,255,255,0.08)"
+                                    : "0 0 32px rgba(167,100,255,0.28), 0 0 60px rgba(167,100,255,0.10), inset 0 1px 0 rgba(255,255,255,0.08)",
+                                color: isPlaying ? "rgba(255,110,110,0.95)" : "rgba(167,100,255,0.95)",
+                            }}
+                        >
+                            <MatIcon name={isPlaying ? "pause" : "play_arrow"} size="1.6rem" />
+                        </motion.button>
+                    </div>
 
-                        {mp3Url ? (
+                    {audioUrl && (
+                        <div
+                            className="flex items-center justify-between gap-3 px-6 pb-5"
+                            style={{ borderTop: "1px solid rgba(167,100,255,0.08)" }}
+                        >
+                            <span className="monoSm text-violet">Your Beat</span>
                             <motion.a
-                                href={mp3Url}
-                                download={MP3_FILENAME}
+                                href={audioUrl}
+                                download="beat.wav"
                                 whileHover={{ scale: 1.06 }}
                                 whileTap={{ scale: 0.94 }}
                                 className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm"
@@ -586,28 +483,10 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                                 }}
                             >
                                 <MatIcon name="download" size="0.9rem" />
-                                DOWNLOAD MP3
+                                DOWNLOAD WAV
                             </motion.a>
-                        ) : (
-                            <motion.button
-                                onClick={() => convertToMp3(true)}
-                                whileHover={isConverting ? {} : { scale: 1.04 }}
-                                whileTap={isConverting ? {} : { scale: 0.96 }}
-                                className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm"
-                                style={{
-                                    border: "1px solid rgba(167,100,255,0.55)",
-                                    color: "rgba(167,100,255,0.85)",
-                                    background: "rgba(167,100,255,0.08)",
-                                    opacity: isConverting ? 0.6 : 1,
-                                    cursor: isConverting ? "default" : "pointer",
-                                }}
-                                disabled={isConverting}
-                            >
-                                <MatIcon name="graphic_eq" size="0.9rem" />
-                                {convertError ? "RETRY MP3" : "EXPORT MP3"}
-                            </motion.button>
-                        )}
-                    </div>
+                        </div>
+                    )}
                 </>
             )}
         </div>

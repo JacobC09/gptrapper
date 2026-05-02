@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from "react"
 import { motion, AnimatePresence } from "motion/react"
 import { toast } from "sonner"
-import { formatTime } from "@/lib/audio"
+import { formatTime, clipFromAudioBuffer, audioBufferToWavBlob, parseMidiNotes } from "@/lib/audio"
 import { useAudioRecorder } from "@/hooks/useAudioRecorder"
 import { Waveform } from "@/components/Waveform"
 import { RecordButton } from "@/components/RecordButton"
@@ -11,17 +11,18 @@ import { ClipRow } from "@/components/ClipRow"
 import { ResultScreen } from "@/components/ResultScreen"
 import GeneratingScreen from "@/components/GenerationScreen"
 import BeatPromptScreen from "@/components/BeatPromptScreen"
-import type { Clip } from "@/lib/audio"
+import { MatIcon } from "@/components/MatIcon"
+import type { Clip, BeatResult } from "@/lib/audio"
 
-type AppStatus = "idle" | "prompting" | "generating" | "done"
+type AppStatus = "idle" | "prompting" | "generating" | "generating-sample" | "done"
 
 export default function Home() {
     const recorder = useAudioRecorder()
     const [clips, setClips] = useState<Clip[]>([])
     const [appStatus, setAppStatus] = useState<AppStatus>("idle")
-    const [resultUrl, setResultUrl] = useState<string | null>(null)
-    const [midiUrl] = useState<string | null>("/twinkle-twinkle-little-star.mid")
+    const [result, setResult] = useState<BeatResult | null>(null)
     const clipsRef = useRef(clips)
+    const fileInputRef = useRef<HTMLInputElement>(null)
     clipsRef.current = clips
 
     const handleToggle = () => {
@@ -47,9 +48,96 @@ export default function Home() {
         })
     }, [])
 
+    const handleUseExample = async () => {
+        if (clipsRef.current.length === 0) {
+            toast("Record some sounds first, then use them in an example beat", { duration: 3000 })
+            return
+        }
+        if (recorder.isRecording) recorder.stop()
+        setAppStatus("generating")
+
+        try {
+            const midiBuf = await fetch("/take-care.mid").then(r => r.arrayBuffer())
+            const notes = await parseMidiNotes(midiBuf)
+            if (notes.length === 0) throw new Error("No notes in MIDI file")
+
+            const totalDuration = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
+
+            const clips = clipsRef.current
+            const decodeCtx = new AudioContext()
+            const clipBuffers = await Promise.all(
+                clips.map(async c => {
+                    const ab = await fetch(c.url).then(r => r.arrayBuffer())
+                    return decodeCtx.decodeAudioData(ab)
+                })
+            )
+            await decodeCtx.close()
+
+            const SR = 44100
+            const offCtx = new OfflineAudioContext(2, Math.ceil((totalDuration + 0.5) * SR), SR)
+            const masterGain = offCtx.createGain()
+            masterGain.gain.value = 0.35
+            masterGain.connect(offCtx.destination)
+
+            for (let i = 0; i < notes.length; i++) {
+                const note = notes[i]
+                const buf = clipBuffers[i % clipBuffers.length]
+                const src = offCtx.createBufferSource()
+                src.buffer = buf
+                src.playbackRate.value = Math.pow(2, (note.midi - 60) / 12)
+                src.connect(masterGain)
+                src.start(note.timeS)
+                src.stop(note.timeS + Math.min(note.durationS, buf.duration))
+            }
+
+            const rendered = await offCtx.startRendering()
+            const wavBlob = audioBufferToWavBlob(rendered)
+            const userSoundsUrl = URL.createObjectURL(wavBlob)
+            const midiUrl = URL.createObjectURL(new Blob([midiBuf], { type: "audio/midi" }))
+
+            setResult({ userSoundsUrl, midiUrl })
+            setAppStatus("done")
+            toast("Beat ready!", { duration: 2000 })
+        } catch (e) {
+            console.error(e)
+            toast("Failed to render example beat", { duration: 2000 })
+            setAppStatus("idle")
+        }
+    }
+
+    const handleUploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0]
+        if (!file) return
+        e.target.value = ""
+        try {
+            const arrayBuf = await file.arrayBuffer()
+            const actx = new AudioContext()
+            const decoded = await actx.decodeAudioData(arrayBuf)
+            await actx.close()
+            const clip = clipFromAudioBuffer(decoded)
+            if (clip.durationMs < 800) {
+                URL.revokeObjectURL(clip.url)
+                toast("File is too short", { duration: 2000 })
+                return
+            }
+            setClips(prev => [...prev, clip])
+        } catch {
+            toast("Could not decode audio file", { duration: 2000 })
+        }
+    }
+
     const handleSubmit = () => {
         if (recorder.isRecording) recorder.stop()
         setAppStatus("prompting")
+    }
+
+    const handleUseSampleBeat = () => {
+        if (recorder.isRecording) recorder.stop()
+        setResult({
+            userSoundsUrl: "/pirates_picks_Ken_Hansen_Ibrahim.wav",
+            midiUrl: "/pirates-of-the-caribbean.mid",
+        })
+        setAppStatus("done")
     }
 
     const handleCreateBeat = async (style: string, additional: string) => {
@@ -63,7 +151,7 @@ export default function Home() {
                 clipsRef.current.map(async (clip, i) => {
                     const res = await fetch(clip.url)
                     const blob = await res.blob()
-                    formData.append("clips", blob, `clip_${i}.webm`)
+                    formData.append("clips", blob, `clip_${i}.${clipsRef.current[i].ext}`)
                 })
             )
 
@@ -71,8 +159,16 @@ export default function Home() {
 
             if (!res.ok) throw new Error(`Server responded ${res.status}`)
 
-            const blob = await res.blob()
-            setResultUrl(URL.createObjectURL(blob))
+            const data = await res.json()
+
+            const b64ToUrl = (b64: string, type: string) =>
+                URL.createObjectURL(new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type }))
+
+            const userSoundsUrl = b64ToUrl(data.userSounds, "audio/wav")
+            const midiUrl = b64ToUrl(data.midi, "audio/midi")
+            const originalUrl = data.original ? b64ToUrl(data.original, "audio/wav") : undefined
+
+            setResult({ userSoundsUrl, midiUrl, originalUrl })
             setAppStatus("done")
             toast("Beat generated!", { duration: 2000 })
         } catch {
@@ -86,9 +182,17 @@ export default function Home() {
             prev.forEach(c => URL.revokeObjectURL(c.url))
             return []
         })
-        setResultUrl(null)
+        setResult(prev => {
+            if (prev) {
+                URL.revokeObjectURL(prev.userSoundsUrl)
+                URL.revokeObjectURL(prev.midiUrl)
+                if (prev.originalUrl) URL.revokeObjectURL(prev.originalUrl)
+            }
+            return null
+        })
         setAppStatus("idle")
     }
+
 
     useEffect(() => () => {
         clipsRef.current.forEach(c => URL.revokeObjectURL(c.url))
@@ -138,6 +242,58 @@ export default function Home() {
                                     <div className="font-headline-md text-primary-container/90 tracking-widest drop-shadow-[0_0_8px_rgba(167,100,255,0.4)]">
                                         {formatTime(recorder.elapsedMs)}
                                     </div>
+                                    <div className="flex items-center gap-3 flex-wrap justify-center">
+                                        <motion.button
+                                            onClick={handleUseExample}
+                                            disabled={recorder.isRecording}
+                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full focus:outline-none monoSm"
+                                            style={{
+                                                border: "1px solid rgba(0,219,233,0.3)",
+                                                color: "rgba(0,219,233,0.65)",
+                                                opacity: recorder.isRecording ? 0.45 : 1,
+                                            }}
+                                        >
+                                            <MatIcon name="music_note" size="0.85rem" />
+                                            USE EXAMPLE
+                                        </motion.button>
+                                        <motion.button
+                                            onClick={() => fileInputRef.current?.click()}
+                                            disabled={recorder.isRecording}
+                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full focus:outline-none monoSm"
+                                            style={{
+                                                border: "1px solid rgba(0,219,233,0.3)",
+                                                color: "rgba(0,219,233,0.65)",
+                                                opacity: recorder.isRecording ? 0.45 : 1,
+                                            }}
+                                        >
+                                            <MatIcon name="upload_file" size="0.85rem" />
+                                            UPLOAD
+                                        </motion.button>
+                                        <motion.button
+                                            onClick={handleUseSampleBeat}
+                                            disabled={recorder.isRecording}
+                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full focus:outline-none monoSm"
+                                            style={{
+                                                border: "1px solid rgba(167,100,255,0.45)",
+                                                color: "rgba(167,100,255,0.8)",
+                                                background: "rgba(167,100,255,0.08)",
+                                                opacity: recorder.isRecording ? 0.45 : 1,
+                                            }}
+                                        >
+                                            <MatIcon name="group" size="0.85rem" />
+                                            PEOPLE BEAT
+                                        </motion.button>
+                                        <input
+                                            ref={fileInputRef}
+                                            type="file"
+                                            accept="audio/*"
+                                            className="hidden"
+                                            onChange={handleUploadFile}
+                                        />
+                                    </div>
                                 </div>
                             </motion.div>
 
@@ -176,9 +332,10 @@ export default function Home() {
                     {appStatus === "prompting" && <BeatPromptScreen key="prompting" onConfirm={handleCreateBeat} />}
 
                     {appStatus === "generating" && <GeneratingScreen key="generating" />}
+                    {appStatus === "generating-sample" && <GeneratingScreen key="generating-sample" mode="sample" />}
 
-                    {appStatus === "done" && (
-                        <ResultScreen key="done" url={resultUrl} midiUrl={midiUrl} onReset={handleReset} />
+                    {appStatus === "done" && result && (
+                        <ResultScreen key="done" result={result} onReset={handleReset} />
                     )}
                 </AnimatePresence>
 

@@ -75,7 +75,7 @@ export function ClipRow({ clip, index, onDelete }: { clip: Clip; index: number; 
             </div>
 
             <div className="flex gap-4">
-                <canvas ref={canvasRef} width={800} height={96} style={{ width: "100%", height: 48, display: "block", borderRadius: 4 }} />
+                <canvas ref={canvasRef} width={800} height={96} style={{ width: "100%", height: 56, display: "block", borderRadius: 8 }} />
                 <div className="flex flex-col gap-2">
                     <ClipButton
                         onClick={handlePlayPause}
