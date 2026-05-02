@@ -66,7 +66,7 @@ export function ClipRow({ clip, index, onDelete }: { clip: Clip; index: number; 
             />
 
             <div className="flex items-center justify-between">
-                <span className="monoMd text-violet/85">
+                <span className="monoMd text-surface-tint/70">
                     CLIP {String(index + 1).padStart(2, "0")}
                 </span>
                 <span className="monoMd text-surface-tint/70">

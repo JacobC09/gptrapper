@@ -20,6 +20,7 @@ export default function Home() {
     const [clips, setClips] = useState<Clip[]>([])
     const [appStatus, setAppStatus] = useState<AppStatus>("idle")
     const [resultUrl, setResultUrl] = useState<string | null>(null)
+    const [midiUrl] = useState<string | null>("/twinkle-twinkle-little-star.mid")
     const clipsRef = useRef(clips)
     clipsRef.current = clips
 
@@ -53,7 +54,8 @@ export default function Home() {
 
     const handleBeatConfirm = async (_style: string, _additional: string) => {
         setAppStatus("generating")
-        await new Promise<void>(resolve => setTimeout(resolve, 4500))
+        // await new Promise<void>(resolve => setTimeout(resolve, 4500))
+        await new Promise<void>(resolve => setTimeout(resolve, 1000))
         setResultUrl(clipsRef.current[0]?.url ?? null)
         setAppStatus("done")
         toast("Beat generated!", { duration: 2000 })
@@ -79,10 +81,10 @@ export default function Home() {
             <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,var(--tw-gradient-stops))] from-surface-container-high/40 via-background to-background -z-10" />
             <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-size-[32px_32px] pointer-events-none -z-10" />
 
-            <main className="grow flex flex-col items-center px-6 py-12 relative z-10 w-full max-w-2xl mx-auto gap-8">
+            <main className="grow flex flex-col items-center px-6 py-12 relative z-10 w-full mx-auto gap-8">
 
                 <div className="w-full text-center pt-2 pb-4 shrink-0">
-                    <h1 className="text-3xl font-bold font-headline-lg text-primary-container tracking-widest uppercase drop-shadow-[0_0_15px_rgba(0,240,255,0.3)]">
+                    <h1 className="text-3xl font-bold font-headline-lg text-primary-container tracking-widest uppercase drop-shadow-[0_0_20px_rgba(0,240,255,0.8)]">
                         GPT <span className="text-base">w</span>RAPPER
                     </h1>
                     <p className="font-label-sm text-outline mt-1 uppercase tracking-[0.2em]">
@@ -98,7 +100,7 @@ export default function Home() {
                             animate={{ opacity: 1, y: 0 }}
                             exit={{ opacity: 0, y: -16 }}
                             transition={{ duration: 0.35 }}
-                            className="flex-1 flex flex-col w-full gap-8"
+                            className="flex-1 flex flex-col w-full gap-8 max-w-2xl"
                         >
                             <motion.div
                                 layout
@@ -113,7 +115,7 @@ export default function Home() {
 
                                 <div className="flex flex-col items-center gap-4">
                                     <RecordButton isRecording={recorder.isRecording} onToggle={handleToggle} />
-                                    <div className="font-headline-md text-violet/90 tracking-widest drop-shadow-[0_0_8px_rgba(167,100,255,0.4)]">
+                                    <div className="font-headline-md text-primary-container/90 tracking-widest drop-shadow-[0_0_8px_rgba(167,100,255,0.4)]">
                                         {formatTime(recorder.elapsedMs)}
                                     </div>
                                 </div>
@@ -156,7 +158,7 @@ export default function Home() {
                     {appStatus === "generating" && <GeneratingScreen key="generating" />}
 
                     {appStatus === "done" && (
-                        <ResultScreen key="done" url={resultUrl} onReset={handleReset} />
+                        <ResultScreen key="done" url={resultUrl} midiUrl={midiUrl} onReset={handleReset} />
                     )}
                 </AnimatePresence>
 

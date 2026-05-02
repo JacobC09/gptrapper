@@ -22,6 +22,7 @@ export function extFromMime(mime: string): string {
 }
 
 export function drawWaveform(canvas: HTMLCanvasElement, bars: number[]) {
+    console.log(bars)
     const ctx = canvas.getContext("2d")!
     const W = canvas.width, H = canvas.height
     ctx.clearRect(0, 0, W, H)

@@ -37,7 +37,7 @@ export default function GeneratingScreen() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -18 }}
             transition={{ duration: 0.4 }}
-            className="flex flex-col w-full gap-8"
+            className="flex flex-col w-full gap-8 max-w-2xl"
         >
             <div className="flex items-end gap-0.5 h-24 w-full">
                 {barAnims.map((anim, i) => (

@@ -4,15 +4,16 @@ import { useState, useRef, useEffect } from "react"
 import { motion } from "motion/react"
 import { BAR_COUNT, drawWaveform, formatTime } from "@/lib/audio"
 import { MatIcon } from "@/components/MatIcon"
+import { MidiPlayer } from "@/components/MidiPlayer"
 
-export function ResultScreen({ url, onReset }: { url: string | null; onReset: () => void }) {
+export function ResultScreen({ url, midiUrl, onReset }: { url: string | null; midiUrl: string | null; onReset: () => void }) {
     const audioRef = useRef<HTMLAudioElement>(null)
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const [isPlaying, setIsPlaying] = useState(false)
     const [progress, setProgress] = useState(0)
     const [durationMs, setDurationMs] = useState(0)
     const [waveformBars] = useState(() =>
-        Array.from({ length: BAR_COUNT }, () => Math.random() * 0.48 + 0.07)
+        Array.from({ length: BAR_COUNT }, () => Math.random() * 0.1)
     )
 
     useEffect(() => {
@@ -40,7 +41,7 @@ export function ResultScreen({ url, onReset }: { url: string | null; onReset: ()
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -18 }}
             transition={{ duration: 0.4 }}
-            className="flex flex-col w-full gap-6"
+            className="flex flex-col w-full gap-6 max-w-4xl"
         >
             <motion.div
                 className="text-center py-3"
@@ -90,7 +91,7 @@ export function ResultScreen({ url, onReset }: { url: string | null; onReset: ()
                 )}
 
                 <div className="flex items-center justify-between">
-                    <span className="monoMd text-violet/85">GENERATED_BEAT_001</span>
+                    <span className="monoMd text-surface-tint text-lg">Generated Beat</span>
                     <span className="monoMd text-surface-tint/50">{formatTime(durationMs)}</span>
                 </div>
 
@@ -144,7 +145,7 @@ export function ResultScreen({ url, onReset }: { url: string | null; onReset: ()
                             download="generated_beat"
                             whileHover={{ scale: 1.06 }}
                             whileTap={{ scale: 0.94 }}
-                            className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm border border-violet/30 text-violet/65"
+                            className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm border border-primary-container/30 text-primary-container/65"
                         >
                             <MatIcon name="download" size="0.9rem" />
                             DOWNLOAD
@@ -152,6 +153,16 @@ export function ResultScreen({ url, onReset }: { url: string | null; onReset: ()
                     )}
                 </div>
             </motion.div>
+
+            {midiUrl && (
+                <motion.div
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.35, duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+                >
+                    <MidiPlayer midiUrl={midiUrl} />
+                </motion.div>
+            )}
 
             <motion.button
                 onClick={onReset}

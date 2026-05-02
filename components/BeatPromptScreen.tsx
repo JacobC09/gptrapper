@@ -28,7 +28,7 @@ export default function BeatPromptScreen({ onConfirm }: { onConfirm: (style: str
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -18 }}
             transition={{ duration: 0.4 }}
-            className="flex flex-col w-full gap-6"
+            className="flex flex-col w-full gap-6 max-w-2xl"
         >
             <div className="text-center">
                 <p className="uppercase tracking-[0.22em] monoMd" style={{ color: "rgba(var(--c-cyan),0.9)" }}>
