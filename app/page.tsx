@@ -9,18 +9,20 @@ import { Waveform } from "@/components/Waveform"
 import { RecordButton } from "@/components/RecordButton"
 import { ClipRow } from "@/components/ClipRow"
 import { ResultScreen } from "@/components/ResultScreen"
+import { MidiResultScreen } from "@/components/MidiResultScreen"
 import GeneratingScreen from "@/components/GenerationScreen"
 import BeatPromptScreen from "@/components/BeatPromptScreen"
 import type { Clip } from "@/lib/audio"
+import type { GenerateResponse, InstrumentType } from "@/lib/types"
 
-type AppStatus = "idle" | "prompting" | "generating" | "done"
+type AppStatus = "idle" | "generating_samples" | "selecting_types" | "prompting_genre" | "generating_midi" | "done"
 
 export default function Home() {
     const recorder = useAudioRecorder()
     const [clips, setClips] = useState<Clip[]>([])
     const [appStatus, setAppStatus] = useState<AppStatus>("idle")
-    const [resultUrl, setResultUrl] = useState<string | null>(null)
-    const [midiUrl] = useState<string | null>("/twinkle-twinkle-little-star.mid")
+    const [result, setResult] = useState<GenerateResponse | null>(null)
+    const [assignedTypes, setAssignedTypes] = useState<InstrumentType[]>([])
     const clipsRef = useRef(clips)
     clipsRef.current = clips
 
@@ -47,38 +49,56 @@ export default function Home() {
         })
     }, [])
 
-    const handleSubmit = () => {
+    const handleSubmit = async () => {
         if (recorder.isRecording) recorder.stop()
-        setAppStatus("prompting")
-    }
-
-    const handleCreateBeat = async (style: string, additional: string) => {
-        setAppStatus("generating")
+        setAppStatus("generating_samples")
 
         try {
             const formData = new FormData()
-            formData.append("prompt", "The style is: " + style + ". " + additional)
-
-            await Promise.all(
-                clipsRef.current.map(async (clip, i) => {
+            formData.append("prompt", "analyze")
+            const blobs = await Promise.all(
+                clipsRef.current.map(async (clip) => {
                     const res = await fetch(clip.url)
-                    const blob = await res.blob()
-                    formData.append("clips", blob, `clip_${i}.webm`)
+                    return res.blob()
                 })
             )
+            blobs.forEach((blob, i) => formData.append("clips", blob, `clip_${i}.webm`))
 
             const res = await fetch("/api/generate", { method: "POST", body: formData })
-
             if (!res.ok) throw new Error(`Server responded ${res.status}`)
 
-            const blob = await res.blob()
-            setResultUrl(URL.createObjectURL(blob))
-            setAppStatus("done")
-            toast("Beat generated!", { duration: 2000 })
+            const json = await res.json() as GenerateResponse
+            setResult(json)
+            setAppStatus("selecting_types")
         } catch {
-            toast("Failed to generate beat", { duration: 2000 })
+            toast("Failed to analyze clips", { duration: 2000 })
             setAppStatus("idle")
         }
+    }
+
+    const handleTypesConfirm = (types: InstrumentType[]) => {
+        setAssignedTypes(types)
+        setAppStatus("prompting_genre")
+    }
+
+    const handleCreateMidi = async (style: string, additional: string) => {
+        setAppStatus("generating_midi")
+
+        try {
+            await fetch("/api/compose", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    samples: result?.samples.map((s, i) => ({ ...s, type: assignedTypes[i] })),
+                    prompt: `${style}. ${additional}`,
+                }),
+            })
+        } catch {
+            // Backend not yet implemented — using public MIDI file
+        }
+
+        setAppStatus("done")
+        toast("Beat generated!", { duration: 2000 })
     }
 
     const handleReset = () => {
@@ -86,7 +106,8 @@ export default function Home() {
             prev.forEach(c => URL.revokeObjectURL(c.url))
             return []
         })
-        setResultUrl(null)
+        setResult(null)
+        setAssignedTypes([])
         setAppStatus("idle")
     }
 
@@ -173,12 +194,26 @@ export default function Home() {
                         </motion.div>
                     )}
 
-                    {appStatus === "prompting" && <BeatPromptScreen key="prompting" onConfirm={handleCreateBeat} />}
+                    {(appStatus === "generating_samples" || appStatus === "generating_midi") && (
+                        <GeneratingScreen key="generating" />
+                    )}
 
-                    {appStatus === "generating" && <GeneratingScreen key="generating" />}
+                    {appStatus === "selecting_types" && result && (
+                        <ResultScreen key="selecting_types" result={result} clips={clips} onConfirm={handleTypesConfirm} />
+                    )}
 
-                    {appStatus === "done" && (
-                        <ResultScreen key="done" url={resultUrl} midiUrl={midiUrl} onReset={handleReset} />
+                    {appStatus === "prompting_genre" && (
+                        <BeatPromptScreen key="prompting_genre" onConfirm={handleCreateMidi} />
+                    )}
+
+                    {appStatus === "done" && result && (
+                        <MidiResultScreen
+                            key="done"
+                            clips={clips}
+                            samples={result.samples}
+                            assignedTypes={assignedTypes}
+                            onReset={handleReset}
+                        />
                     )}
                 </AnimatePresence>
 

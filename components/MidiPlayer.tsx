@@ -5,10 +5,12 @@ import { motion } from "motion/react"
 import { formatTime } from "@/lib/audio"
 import { MatIcon } from "@/components/MatIcon"
 import lamejs from "lamejs"
+import type { Clip } from "@/lib/audio"
+import type { InstrumentType, Sample } from "@/lib/types"
 
 type ToneNamespace = typeof import("tone")
 
-type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number }
+type ParsedNote = { midi: number; timeS: number; durationS: number; velocity: number; channel: number }
 
 type RollLayout = {
     minPitch: number
@@ -30,11 +32,23 @@ const MP3_FILENAME = "generated_beat.mp3"
 const MP3_TAIL_S = 0.6
 
 const PITCH_COLORS: [number, number, number][] = [
-    [0,   219, 233],   // Primary cyan
-    [100, 150, 255],   // Light blue
-    [180,  80, 255],   // Purple
-    [255,  60, 180],   // Magenta
+    [0,   219, 233],
+    [100, 150, 255],
+    [180,  80, 255],
+    [255,  60, 180],
 ]
+
+// Instrument types that respond to pitch (get pitch-shifted to each MIDI note)
+const MELODIC_TYPES = new Set<InstrumentType>([
+    "piano", "aguitar", "bguitar", "eguitar", "cello", "violin", "flute", "trumpet",
+])
+
+// GM standard drum note assignments — sample is loaded at this note so no pitch shift occurs
+const GM_DRUM_NOTES: Partial<Record<InstrumentType, string>> = {
+    kickdrum:  "C2",   // MIDI 36
+    snaredrum: "D2",   // MIDI 38
+    hihat:     "F#2",  // MIDI 42
+}
 
 type RollSnapshots = { dim: HTMLCanvasElement; bright: HTMLCanvasElement }
 
@@ -73,7 +87,94 @@ function audioBufferToMp3(buffer: AudioBuffer): Blob {
 
     const end = mp3encoder.flush()
     if (end.length > 0) mp3Data.push(new Uint8Array(end))
-    return new Blob(mp3Data, { type: "audio/mpeg" })
+    return new Blob(mp3Data as BlobPart[], { type: "audio/mpeg" })
+}
+
+// Encode an AudioBuffer as a WAV blob so Tone.Sampler can load it via URL
+function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
+    const nc = buffer.numberOfChannels
+    const sr = buffer.sampleRate
+    const len = buffer.length
+    const dataBytes = len * nc * 2
+    const wav = new ArrayBuffer(44 + dataBytes)
+    const v = new DataView(wav)
+    const w = (o: number, str: string) => [...str].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)))
+    w(0, "RIFF"); v.setUint32(4, 36 + dataBytes, true)
+    w(8, "WAVE"); w(12, "fmt "); v.setUint32(16, 16, true)
+    v.setUint16(20, 1, true); v.setUint16(22, nc, true)
+    v.setUint32(24, sr, true); v.setUint32(28, sr * nc * 2, true)
+    v.setUint16(32, nc * 2, true); v.setUint16(34, 16, true)
+    w(36, "data"); v.setUint32(40, dataBytes, true)
+    let o = 44
+    for (let i = 0; i < len; i++) {
+        for (let ch = 0; ch < nc; ch++) {
+            const x = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]))
+            v.setInt16(o, Math.round(x * 32767), true); o += 2
+        }
+    }
+    return new Blob([wav], { type: "audio/wav" })
+}
+
+// Decode all needed clips, slice each sample out, return WAV blob URLs ready for Tone.Sampler
+async function buildSamplerData(
+    clips: Clip[],
+    samples: Sample[],
+    assignedTypes: InstrumentType[],
+): Promise<{ melodicUrl: string | null; drumUrls: Record<string, string>; allUrls: string[] }> {
+    const ctx = new AudioContext()
+    const cached = new Map<number, AudioBuffer>()
+    const allUrls: string[] = []
+
+    const getBuffer = async (clipIdx: number): Promise<AudioBuffer> => {
+        if (cached.has(clipIdx)) return cached.get(clipIdx)!
+        const res = await fetch(clips[clipIdx].url)
+        const decoded = await ctx.decodeAudioData(await res.arrayBuffer())
+        cached.set(clipIdx, decoded)
+        return decoded
+    }
+
+    const slice = (full: AudioBuffer, startS: number, durS: number): AudioBuffer => {
+        const sr = full.sampleRate
+        const start = Math.floor(startS * sr)
+        const n = Math.max(1, Math.min(Math.ceil(durS * sr), full.length - start))
+        const out = ctx.createBuffer(full.numberOfChannels, n, sr)
+        for (let ch = 0; ch < full.numberOfChannels; ch++) {
+            out.getChannelData(ch).set(full.getChannelData(ch).subarray(start, start + n))
+        }
+        return out
+    }
+
+    const toUrl = (buf: AudioBuffer): string => {
+        const url = URL.createObjectURL(audioBufferToWavBlob(buf))
+        allUrls.push(url)
+        return url
+    }
+
+    // Find the first melodic sample — fall back to any sample if none are melodic-typed
+    let melodicUrl: string | null = null
+    const melodicIdx = assignedTypes.findIndex(t => MELODIC_TYPES.has(t))
+    const effectiveMelodicIdx = melodicIdx !== -1 ? melodicIdx : (samples.length > 0 ? 0 : -1)
+    if (effectiveMelodicIdx !== -1) {
+        const s = samples[effectiveMelodicIdx]
+        if (s && clips[s.clip_index]) {
+            melodicUrl = toUrl(slice(await getBuffer(s.clip_index), s.start_s, s.duration_s))
+        }
+    }
+
+    // Find drum samples
+    const drumUrls: Record<string, string> = {}
+    for (const [type, note] of Object.entries(GM_DRUM_NOTES) as [InstrumentType, string][]) {
+        const idx = assignedTypes.indexOf(type)
+        if (idx !== -1) {
+            const s = samples[idx]
+            if (s && clips[s.clip_index]) {
+                drumUrls[note] = toUrl(slice(await getBuffer(s.clip_index), s.start_s, s.duration_s))
+            }
+        }
+    }
+
+    await ctx.close()
+    return { melodicUrl, drumUrls, allUrls }
 }
 
 function getTotalDurationS(notes: ParsedNote[]): number {
@@ -112,7 +213,7 @@ async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
         velocity: Math.min(Math.max(note.velocity, 0.1), 1),
     }))
 
-    return Tone.Offline(({ transport }) => {
+    const toneBuffer = await Tone.Offline(({ transport }) => {
         const synth = createSynth(Tone)
         new Tone.Part((time, value) => {
             synth.triggerAttackRelease(
@@ -124,6 +225,7 @@ async function renderMidiToBuffer(notes: ParsedNote[]): Promise<AudioBuffer> {
         }, events).start(0)
         transport.start(0)
     }, renderDurationS)
+    return toneBuffer.get()!
 }
 
 function isBlack(midi: number) { return BLACK_KEYS.has(midi % 12) }
@@ -204,7 +306,14 @@ function drawPlayhead(ctx: CanvasRenderingContext2D, snapshots: RollSnapshots, l
     ctx.restore()
 }
 
-export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
+type SamplerPair = { melodic: unknown; percussion: unknown }
+
+export function MidiPlayer({ midiUrl, clips, samples, assignedTypes }: {
+    midiUrl: string
+    clips?: Clip[]
+    samples?: Sample[]
+    assignedTypes?: InstrumentType[]
+}) {
     const [status, setStatus] = useState<"loading" | "ready" | "error">("loading")
     const [isPlaying, setIsPlaying] = useState(false)
     const [progress, setProgress] = useState(0)
@@ -213,6 +322,8 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
     const [mp3Url, setMp3Url] = useState<string | null>(null)
     const [isConverting, setIsConverting] = useState(false)
     const [convertError, setConvertError] = useState<string | null>(null)
+    const [samplersLoading, setSamplersLoading] = useState(false)
+    const [samplersReady, setSamplersReady] = useState(false)
 
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const containerRef = useRef<HTMLDivElement>(null)
@@ -220,6 +331,8 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
     const rollLayoutRef = useRef<RollLayout | null>(null)
     const snapshotRef = useRef<RollSnapshots | null>(null)
     const synthRef = useRef<unknown>(null)
+    const samplersRef = useRef<SamplerPair | null>(null)
+    const samplerUrlsRef = useRef<string[]>([])
     const rafRef = useRef<number>(0)
     const progressRef = useRef(0)
     progressRef.current = progress
@@ -227,10 +340,9 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
     const autoConvertRef = useRef(false)
     const mountedRef = useRef(true)
 
-    useEffect(() => () => {
-        mountedRef.current = false
-    }, [])
+    useEffect(() => () => { mountedRef.current = false }, [])
 
+    // Load MIDI
     useEffect(() => {
         const controller = new AbortController()
         setStatus("loading")
@@ -240,10 +352,11 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         setMp3Url(null)
         setIsConverting(false)
         setConvertError(null)
+        setSamplersReady(false)
         autoDownloadRef.current = false
         autoConvertRef.current = false
 
-        (async () => {
+        ;(async () => {
             try {
                 const res = await fetch(midiUrl, { signal: controller.signal })
                 if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -252,12 +365,14 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                 const midi = new Midi(buf)
                 const notes: ParsedNote[] = []
                 for (const track of midi.tracks) {
+                    const channel = track.channel ?? 0
                     for (const note of track.notes) {
                         notes.push({
                             midi: note.midi,
                             timeS: note.time,
                             durationS: note.duration,
                             velocity: note.velocity ?? 0.8,
+                            channel,
                         })
                     }
                 }
@@ -275,6 +390,67 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
 
         return () => { controller.abort() }
     }, [midiUrl])
+
+    // Load samplers from recorded clips once MIDI is ready
+    useEffect(() => {
+        if (status !== "ready") return
+        if (!clips?.length || !samples?.length || !assignedTypes?.length) return
+
+        let cancelled = false
+        setSamplersLoading(true)
+        setSamplersReady(false)
+
+        buildSamplerData(clips, samples, assignedTypes).then(async ({ melodicUrl, drumUrls, allUrls }) => {
+            if (cancelled) { allUrls.forEach(u => URL.revokeObjectURL(u)); return }
+
+            const Tone = await import("tone")
+
+            // Dispose previous samplers
+            const prev = samplersRef.current
+            if (prev) {
+                (prev.melodic as { dispose?: () => void })?.dispose?.()
+                ;(prev.percussion as { dispose?: () => void })?.dispose?.()
+            }
+            samplerUrlsRef.current.forEach(u => URL.revokeObjectURL(u))
+            samplerUrlsRef.current = allUrls
+
+            const next: SamplerPair = { melodic: null, percussion: null }
+            const loadPromises: Promise<void>[] = []
+
+            if (melodicUrl) {
+                loadPromises.push(new Promise<void>((resolve, reject) => {
+                    next.melodic = new Tone.Sampler({
+                        urls: { "C4": melodicUrl },
+                        release: 0.8,
+                        onload: resolve,
+                        onerror: (e: Error) => reject(e),
+                    }).toDestination()
+                }))
+            }
+            if (Object.keys(drumUrls).length > 0) {
+                loadPromises.push(new Promise<void>((resolve, reject) => {
+                    next.percussion = new Tone.Sampler({
+                        urls: drumUrls,
+                        release: 0.3,
+                        onload: resolve,
+                        onerror: (e: Error) => reject(e),
+                    }).toDestination()
+                }))
+            }
+
+            await Promise.all(loadPromises)
+            if (!cancelled && mountedRef.current) {
+                samplersRef.current = next
+                setSamplersLoading(false)
+                setSamplersReady(true)
+            }
+        }).catch((e) => {
+            console.error("[MidiPlayer] sampler load failed:", e)
+            if (!cancelled && mountedRef.current) setSamplersLoading(false)
+        })
+
+        return () => { cancelled = true }
+    }, [status, clips, samples, assignedTypes])
 
     useEffect(() => () => {
         if (mp3Url) URL.revokeObjectURL(mp3Url)
@@ -312,36 +488,31 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         void convertToMp3(true)
     }, [status, midiUrl, convertToMp3])
 
-    // Effect 2: Draw piano roll when ready, and on resize
+    // Draw piano roll
     const redraw = useCallback(() => {
         const canvas = canvasRef.current
         const container = containerRef.current
         if (!canvas || !container || notesRef.current.length === 0) return
         const dpr = window.devicePixelRatio || 1
         const cssW = container.offsetWidth
-        const cssH = CANVAS_HEIGHT_PX
         const W = Math.round(cssW * dpr)
-        const H = Math.round(cssH * dpr)
-        canvas.width = W
-        canvas.height = H
+        const H = Math.round(CANVAS_HEIGHT_PX * dpr)
+        canvas.width = W; canvas.height = H
         canvas.style.width = `${cssW}px`
-        canvas.style.height = `${cssH}px`
+        canvas.style.height = `${CANVAS_HEIGHT_PX}px`
 
         const notes = notesRef.current
         const minPitch = notes.reduce((m, n) => Math.min(m, n.midi), 127) - PITCH_PAD
         const maxPitch = notes.reduce((m, n) => Math.max(m, n.midi), 0) + PITCH_PAD
-        const pitchRange = maxPitch - minPitch + 1
-        const rowH = H / pitchRange
+        const rowH = H / (maxPitch - minPitch + 1)
         const totalS = notes.reduce((m, n) => Math.max(m, n.timeS + n.durationS), 0)
 
         const layout: RollLayout = { minPitch, maxPitch, totalS, W, H, rowH, dpr }
         rollLayoutRef.current = layout
         snapshotRef.current = drawRoll(canvas, notes, layout)
 
-        // Restore playhead if mid-song
         if (progressRef.current > 0) {
-            const ctx = canvas.getContext("2d")!
-            drawPlayhead(ctx, snapshotRef.current, layout, progressRef.current)
+            drawPlayhead(canvas.getContext("2d")!, snapshotRef.current, layout, progressRef.current)
         }
     }, [])
 
@@ -353,12 +524,9 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         return () => observer.disconnect()
     }, [status, redraw])
 
-    // Effect 3: rAF playhead loop
+    // rAF playhead loop
     useEffect(() => {
-        if (!isPlaying) {
-            cancelAnimationFrame(rafRef.current)
-            return
-        }
+        if (!isPlaying) { cancelAnimationFrame(rafRef.current); return }
         const canvas = canvasRef.current
         if (!canvas) return
 
@@ -379,7 +547,6 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                 setProgress(0)
                 Tone.getTransport().stop()
                 Tone.getTransport().seconds = 0
-                // Redraw without playhead
                 snapshotRef.current && ctx.drawImage(snapshotRef.current.dim, 0, 0)
             }
         }
@@ -388,17 +555,19 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         return () => cancelAnimationFrame(rafRef.current)
     }, [isPlaying])
 
-    // Effect 4: Teardown
+    // Teardown
     useEffect(() => {
         return () => {
             cancelAnimationFrame(rafRef.current)
-            import("tone").then(Tone => {
-                Tone.getTransport().stop()
-                Tone.getTransport().cancel()
-            })
-            const s = synthRef.current as { dispose?: () => void } | null
-            s?.dispose?.()
+            import("tone").then(Tone => { Tone.getTransport().stop(); Tone.getTransport().cancel() })
+            ;(synthRef.current as { dispose?: () => void } | null)?.dispose?.()
             synthRef.current = null
+            const s = samplersRef.current
+            if (s) {
+                (s.melodic as { dispose?: () => void })?.dispose?.()
+                ;(s.percussion as { dispose?: () => void })?.dispose?.()
+            }
+            samplerUrlsRef.current.forEach(u => URL.revokeObjectURL(u))
         }
     }, [])
 
@@ -411,13 +580,7 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         await Tone.start()
 
         if (!synthRef.current) {
-            const synth = new Tone.PolySynth(Tone.Synth, {
-                oscillator: { type: "triangle" },
-                envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 0.4 },
-                volume: -12,
-            })
-            synth.toDestination()
-            synthRef.current = synth
+            synthRef.current = createSynth(Tone)
         }
 
         const transport = Tone.getTransport()
@@ -429,18 +592,26 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
 
         const notes = notesRef.current
         const synth = synthRef.current as InstanceType<typeof Tone.PolySynth>
+        const samplers = samplersRef.current
 
         for (const note of notes) {
             if (note.timeS + note.durationS <= offsetS) continue
             const startDelay = Math.max(note.timeS - offsetS, 0)
-            const noteStart = `+${startDelay}`
             transport.schedule((time) => {
-                synth.triggerAttackRelease(
-                    Tone.Frequency(note.midi, "midi").toNote(),
-                    Math.max(note.durationS - Math.max(offsetS - note.timeS, 0), 0.05),
-                    time
-                )
-            }, noteStart)
+                const noteStr = Tone.Frequency(note.midi, "midi").toNote()
+                const dur = Math.max(note.durationS - Math.max(offsetS - note.timeS, 0), 0.05)
+                const vel = Math.min(Math.max(note.velocity, 0.1), 1)
+
+                const sampler = (note.channel === 9
+                    ? samplers?.percussion
+                    : samplers?.melodic) as InstanceType<typeof Tone.Sampler> | null | undefined
+
+                if (sampler) {
+                    sampler.triggerAttackRelease(noteStr, dur, time, vel)
+                } else {
+                    synth.triggerAttackRelease(noteStr, dur, time, vel)
+                }
+            }, `+${startDelay}`)
         }
 
         transport.start()
@@ -461,13 +632,9 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
         const rect = e.currentTarget.getBoundingClientRect()
         const ratio = Math.max(0, Math.min((e.clientX - rect.left) / rect.width, 1))
         setProgress(ratio)
-        const ctx = canvas.getContext("2d")!
-        drawPlayhead(ctx, snapshot, layout, ratio)
-
+        drawPlayhead(canvas.getContext("2d")!, snapshot, layout, ratio)
         if (isPlaying) {
-            import("tone").then(Tone => {
-                Tone.getTransport().seconds = ratio * layout.totalS
-            })
+            import("tone").then(Tone => { Tone.getTransport().seconds = ratio * layout.totalS })
         }
     }
 
@@ -486,14 +653,24 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                 className="flex items-center justify-between px-6 py-4"
                 style={{ borderBottom: "1px solid rgba(167,100,255,0.08)" }}
             >
-                <div className="flex items-center gap-2">
-                    <span className="monoMd text-violet">Generated Midi</span>
+                <span className="monoMd text-violet">Generated Midi</span>
+                <div className="flex items-center gap-3">
+                    {samplersLoading && (
+                        <span className="monoSm" style={{ color: "rgba(0,219,233,0.55)", fontSize: "10px" }}>
+                            LOADING SAMPLES...
+                        </span>
+                    )}
+                    {samplersReady && !samplersLoading && (
+                        <span className="monoSm" style={{ color: "rgba(0,219,233,0.55)", fontSize: "10px" }}>
+                            USING YOUR SAMPLES
+                        </span>
+                    )}
+                    {status === "ready" && (
+                        <span className="monoSm" style={{ color: "rgba(167,100,255,0.8)", fontSize: "10px" }}>
+                            {formatTime(currentMs)}&thinsp;/&thinsp;{formatTime(durationMs)}
+                        </span>
+                    )}
                 </div>
-                {status === "ready" && (
-                    <span className="monoSm" style={{ color: "rgba(167,100,255)", fontSize: "10px" }}>
-                        {formatTime(currentMs)}&thinsp;/&thinsp;{formatTime(durationMs)}
-                    </span>
-                )}
             </div>
 
             {status === "loading" && (
@@ -534,8 +711,6 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                         className="flex items-center justify-center px-6 py-4"
                         style={{ borderTop: "1px solid rgba(0,219,233,0.06)" }}
                     >
-
-
                         <motion.button
                             onClick={isPlaying ? pausePlayback : startPlayback}
                             whileHover={{ scale: 1.08 }}
@@ -552,7 +727,6 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                         >
                             <MatIcon name={isPlaying ? "pause" : "play_arrow"} size="1.4rem" />
                         </motion.button>
-
                     </div>
 
                     <div
@@ -561,32 +735,18 @@ export function MidiPlayer({ midiUrl }: { midiUrl: string }) {
                     >
                         <div className="flex items-center gap-2">
                             <span className="monoSm text-violet">MP3 Export</span>
-                            {isConverting && (
-                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>RENDERING...</span>
-                            )}
-                            {convertError && (
-                                <span className="monoSm" style={{ color: "rgba(255,80,80,0.7)" }}>{convertError}</span>
-                            )}
-                            {mp3Url && !isConverting && !convertError && (
-                                <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>READY</span>
-                            )}
+                            {isConverting && <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>RENDERING...</span>}
+                            {convertError && <span className="monoSm" style={{ color: "rgba(255,80,80,0.7)" }}>{convertError}</span>}
+                            {mp3Url && !isConverting && !convertError && <span className="monoSm" style={{ color: "rgba(0,219,233,0.7)" }}>READY</span>}
                         </div>
-
                         {mp3Url ? (
                             <motion.a
-                                href={mp3Url}
-                                download={MP3_FILENAME}
-                                whileHover={{ scale: 1.06 }}
-                                whileTap={{ scale: 0.94 }}
+                                href={mp3Url} download={MP3_FILENAME}
+                                whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.94 }}
                                 className="flex items-center gap-1.5 px-4 py-2 rounded-full focus:outline-none monoSm"
-                                style={{
-                                    border: "1px solid rgba(0,219,233,0.55)",
-                                    color: "rgba(0,219,233,0.85)",
-                                    background: "rgba(0,219,233,0.08)",
-                                }}
+                                style={{ border: "1px solid rgba(0,219,233,0.55)", color: "rgba(0,219,233,0.85)", background: "rgba(0,219,233,0.08)" }}
                             >
-                                <MatIcon name="download" size="0.9rem" />
-                                DOWNLOAD MP3
+                                <MatIcon name="download" size="0.9rem" />DOWNLOAD MP3
                             </motion.a>
                         ) : (
                             <motion.button
